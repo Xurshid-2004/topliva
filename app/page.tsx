@@ -27,6 +27,10 @@ interface FuelRecord {
 interface Staff {
   id: string; erju: string; zapravka: string; tabelNumber: string; fullName: string;
 }
+interface ClosedDayMeta {
+  date: string;
+  closedAt: number;
+}
 
 const ERJU_DATA = [
   { name: 'Toshkent ERJU', short: 'Тошкент', zapravkalar: ['Toshkent zapravka', 'Angren zapravka', 'Sirdaryo zapravka', 'Xovos zapravka', 'Jizzax zapravka'] },
@@ -101,12 +105,15 @@ const TrainFuelSystem = () => {
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [isTodayClosed, setIsTodayClosed] = useState(false);
   const [closedDates, setClosedDates] = useState<string[]>([]);
+  const [closedDaysMeta, setClosedDaysMeta] = useState<ClosedDayMeta[]>([]);
   const [isMounted, setIsMounted] = useState(false);
+  const [activeEntryDate, setActiveEntryDate] = useState(new Date().toISOString().split('T')[0]);
   const [isMobileExportOpen, setIsMobileExportOpen] = useState(false);
   const [mobileExportTitle, setMobileExportTitle] = useState('');
   const [mobileExportType, setMobileExportType] = useState<'pdf' | 'erju'>('pdf');
   const [mobileExportRows, setMobileExportRows] = useState<FuelRecord[]>([]);
   const mobileExportRef = useRef<HTMLDivElement | null>(null);
+  const currentDateRef = useRef(new Date().toISOString().split('T')[0]);
 
   useEffect(() => {
     setIsMounted(true);
@@ -132,8 +139,15 @@ const TrainFuelSystem = () => {
       setSeriesOptionsState(data);
     });
     const unsubClosed = onSnapshot(query(collection(db, 'closedDays')), (snap) => {
-      const data = snap.docs.map((d) => d.id);
-      setClosedDates(data);
+      const metas = snap.docs.map((d) => {
+        const payload = d.data() as { date?: string; closedAt?: number };
+        return {
+          date: payload.date || d.id,
+          closedAt: Number(payload.closedAt || 0)
+        };
+      });
+      setClosedDaysMeta(metas);
+      setClosedDates(metas.map(m => m.date));
     });
     return () => {
       unsubRows();
@@ -256,8 +270,8 @@ const TrainFuelSystem = () => {
   };
   const selectSklad = (keyOrValue: string) => { handleSupplyPointInput(keyOrValue, true); setIsSkladOpen(false); };
   const visibleRows = useMemo(
-    () => rows.filter(r => !closedDates.includes(r.date)),
-    [rows, closedDates]
+    () => rows.filter(r => r.date === activeEntryDate && !closedDates.includes(r.date)),
+    [rows, closedDates, activeEntryDate]
   );
   const stats = useMemo(() => ({ total: visibleRows.reduce((s, r) => s + (Number(r.balanceBefore) || 0) + (Number(r.fuelAmount) || 0), 0) }), [visibleRows]);
   const formatDate = (d: Date) => `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${d.getFullYear()}`;
@@ -388,8 +402,7 @@ const TrainFuelSystem = () => {
       return d >= startAt && d <= endAt;
     });
   };
-  const todayIso = new Date().toISOString().split('T')[0];
-  const todayRows = rows.filter(r => r.date === todayIso);
+  const todayRows = rows.filter(r => r.date === activeEntryDate);
   const todayTotal = todayRows.reduce((s, r) => s + (Number(r.balanceBefore) || 0) + (Number(r.fuelAmount) || 0), 0);
   const isMobileDevice = () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches;
   const openMobileExport = (type: 'pdf' | 'erju', sourceRows: FuelRecord[]) => {
@@ -416,7 +429,7 @@ const TrainFuelSystem = () => {
       const now = new Date();
       await addDoc(collection(db, 'fuelRecords'), {
         ...(formData as FuelRecord),
-        date: now.toISOString().split('T')[0],
+        date: activeEntryDate,
         time: now.toLocaleTimeString('uz-UZ', { hour: '2-digit', minute: '2-digit' }),
         createdAt: now.getTime()
       });
@@ -432,14 +445,25 @@ const TrainFuelSystem = () => {
   const clearForm = () => { setFormData({ supplyPoint: '', route: '', locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '', staffName: '' }); setStaffInputRaw(''); setSupplyPointRaw(''); supplyPointRawRef.current = ''; setEditingId(null); };
 
   useEffect(() => {
-    setIsTodayClosed(closedDates.includes(todayIso));
-  }, [closedDates, todayIso]);
+    setIsTodayClosed(closedDates.includes(activeEntryDate));
+  }, [closedDates, activeEntryDate]);
+  useEffect(() => {
+    currentDateRef.current = new Date().toISOString().split('T')[0];
+    const timer = setInterval(() => {
+      const nowIso = new Date().toISOString().split('T')[0];
+      if (nowIso !== currentDateRef.current) {
+        currentDateRef.current = nowIso;
+        setActiveEntryDate(nowIso);
+      }
+    }, 30000);
+    return () => clearInterval(timer);
+  }, []);
 
   if (!isMounted || !isLoaded) return null;
 
   const erjuAllStaff = staffList.filter(s => s.erju === selectedErju);
   const selectedErjuData = ERJU_DATA.find(e => e.name === selectedErju);
-  const todayDate = formatDate(new Date());
+  const todayDate = formatDate(parseIsoDate(activeEntryDate));
 
   // ─── Theme tokens ───────────────────────────────────────────────────────────
   const t = isDarkMode ? {
@@ -782,7 +806,7 @@ const TrainFuelSystem = () => {
                   if (isTodayClosed) return;
                   const ok = window.confirm("Bugungi kunni yopishga aniqmisiz?");
                   if (!ok) return;
-                  await setDoc(doc(db, 'closedDays', todayIso), { date: todayIso, closedAt: Date.now() });
+                  await setDoc(doc(db, 'closedDays', activeEntryDate), { date: activeEntryDate, closedAt: Date.now() });
                 }}
                 disabled={isTodayClosed}
                 className={`text-xs font-semibold px-4 py-2 rounded-lg transition-all active:scale-95
@@ -795,10 +819,23 @@ const TrainFuelSystem = () => {
               </button>
               <button
                 type="button"
-                disabled
-                className={`text-xs font-semibold px-4 py-2 rounded-lg transition-all active:scale-95 ${isDarkMode ? 'bg-slate-700 text-slate-400 cursor-not-allowed' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}
+                onClick={async () => {
+                  if (closedDaysMeta.length === 0) return;
+                  const last = [...closedDaysMeta].sort((a, b) => b.closedAt - a.closedAt)[0];
+                  if (!last) return;
+                  const ok = window.confirm(`${last.date} yopilgan kunini qaytarilsinmi?`);
+                  if (!ok) return;
+                  await deleteDoc(doc(db, 'closedDays', last.date));
+                  setActiveEntryDate(last.date);
+                }}
+                disabled={closedDaysMeta.length === 0}
+                className={`text-xs font-semibold px-4 py-2 rounded-lg transition-all active:scale-95
+                  ${closedDaysMeta.length === 0
+                    ? (isDarkMode ? 'bg-slate-700 text-slate-400 cursor-not-allowed' : 'bg-slate-200 text-slate-400 cursor-not-allowed')
+                    : 'bg-amber-500 hover:bg-amber-400 text-slate-900 shadow-sm'
+                  }`}
               >
-                Ёпилган кун сақланди
+                Ёпилган кечаги кунни қайтариш
               </button>
             </div>
           </div>
@@ -1207,14 +1244,16 @@ interface FormInputProps {
   onChange: (v: string) => void;
   theme: string;
   labelClass: string;
+  placeholder?: string;
 }
-const FormInput = ({ label, type = 'text', value, onChange, theme, labelClass }: FormInputProps) => (
+const FormInput = ({ label, type = 'text', value, onChange, theme, labelClass, placeholder }: FormInputProps) => (
   <div className="flex flex-col gap-1">
     <label className={`text-[10px] font-bold uppercase tracking-wider ${labelClass}`}>{label}</label>
     <input
       type={type}
       value={value || ''}
       onChange={e => onChange(e.target.value)}
+      placeholder={placeholder || `${label}...`}
       className={`${theme} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
     />
   </div>
