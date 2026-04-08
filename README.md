@@ -1,5 +1,26 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Firebase Environment Setup
+
+1. Copy `.env.example` to `.env.local`
+2. Fill all `NEXT_PUBLIC_FIREBASE_*` values
+3. Restart dev server
+
+Vercel deployment:
+
+- Open project in Vercel
+- Go to **Settings -> Environment Variables**
+- Add all keys from `.env.example`
+- Redeploy
+
+Required Firestore collections (auto-created by app on first write):
+
+- `fuelRecords`
+- `staff`
+- `moveOptions`
+- `seriesOptions`
+- `closedDays`
+
 ## Getting Started
 
 First, run the development server:

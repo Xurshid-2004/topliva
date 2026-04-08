@@ -11,7 +11,8 @@ type Selection = {
 type Props = {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (start: Date | null, end: Date | null) => void;
+  onExportPdf: (start: Date | null, end: Date | null) => void;
+  onExportErjuPdf: (start: Date | null, end: Date | null) => void;
 };
 
 // Helper functions to replace date-fns
@@ -49,7 +50,7 @@ const formatDate = (date: Date) => {
   return date.getDate().toString();
 };
 
-const RentCalendar: React.FC<Props> = ({ isOpen, onClose, onSave }) => {
+const RentCalendar: React.FC<Props> = ({ isOpen, onClose, onExportPdf, onExportErjuPdf }) => {
   const [currentMonth, setCurrentMonth] = useState(new Date());
   const [selection, setSelection] = useState<Selection>({
     start: null,
@@ -110,21 +111,21 @@ const RentCalendar: React.FC<Props> = ({ isOpen, onClose, onSave }) => {
     }
 
     return (
-      <div className="flex-1 p-3">
-        <h3 className="text-center font-bold text-lg mb-3 text-black">
+      <div className="flex-1 p-2 sm:p-3">
+        <h3 className="text-center font-bold text-base sm:text-lg mb-3 text-black">
           {getMonthName(monthDate)} {year}
         </h3>
 
         <div className="grid grid-cols-7 gap-1 text-center">
           {["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"].map((d) => (
-            <div key={d} className="font-bold text-gray-800">
+            <div key={d} className="font-bold text-gray-800 text-xs sm:text-sm">
               {d}
             </div>
           ))}
 
           {days.map((day, i) => {
             if (!day) {
-              return <div key={i} className="h-11 w-11" />;
+              return <div key={i} className="h-8 w-8 sm:h-10 sm:w-10 mx-auto" />;
             }
 
             const selected =
@@ -145,8 +146,8 @@ const RentCalendar: React.FC<Props> = ({ isOpen, onClose, onSave }) => {
                 onClick={() => handleClick(day)}
                 disabled={isFuture}
                 className={`
-                  h-10 w-10 flex items-center justify-center
-                  rounded-full font-bold text-sm
+                  h-8 w-8 sm:h-10 sm:w-10 mx-auto flex items-center justify-center
+                  rounded-full font-bold text-xs sm:text-sm
                   ${selected ? "bg-purple-600 text-white" : ""}
                   ${range ? "bg-purple-100" : ""}
                   ${today ? "border-2 border-red-500" : ""}
@@ -160,11 +161,6 @@ const RentCalendar: React.FC<Props> = ({ isOpen, onClose, onSave }) => {
         </div>
       </div>
     );
-  };
-
-  const handleSave = () => {
-    onSave(selection.start, selection.end || selection.start);
-    onClose();
   };
 
   const reset = () => {
@@ -181,7 +177,7 @@ const RentCalendar: React.FC<Props> = ({ isOpen, onClose, onSave }) => {
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-2xl p-6 w-full max-w-5xl"
+        className="bg-white rounded-2xl p-4 sm:p-6 w-full max-w-5xl max-h-[92vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex justify-between items-center mb-4">
@@ -204,8 +200,9 @@ const RentCalendar: React.FC<Props> = ({ isOpen, onClose, onSave }) => {
           </button>
         </div>
 
-        <div className="flex">
+        <div className="flex flex-col md:flex-row">
           {renderMonth(currentMonth)}
+          <div className="hidden md:block w-px bg-slate-200 my-2" />
           {renderMonth(nextMonthDate)}
         </div>
 
@@ -228,14 +225,20 @@ const RentCalendar: React.FC<Props> = ({ isOpen, onClose, onSave }) => {
 
           <div className="flex flex-wrap gap-2">
             <button
-              onClick={() => {} }
+              onClick={() => {
+                onExportPdf(selection.start, selection.end || selection.start);
+                onClose();
+              }}
               className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-all duration-200 shadow-sm hover:shadow-md text-sm font-semibold"
             >
               PDF
             </button>
 
             <button
-              onClick={() => {} }
+              onClick={() => {
+                onExportErjuPdf(selection.start, selection.end || selection.start);
+                onClose();
+              }}
               className="bg-fuchsia-600 text-white px-4 py-2 rounded-lg hover:bg-fuchsia-700 transition-all duration-200 shadow-sm hover:shadow-md text-sm font-semibold"
             >
               ERJU PDF
