@@ -4,17 +4,20 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import RentCalendar from './calendar';
 import html2canvas from 'html2canvas';
+import { useRouter } from 'next/navigation';
 import { db } from './lib/firbase';
 import {
   addDoc,
   collection,
   deleteDoc,
   doc,
+  getDocs,
   onSnapshot,
   orderBy,
   query,
   setDoc,
-  updateDoc
+  updateDoc,
+  writeBatch
 } from 'firebase/firestore';
 
 interface FuelRecord {
@@ -65,7 +68,8 @@ const skladOptions = [
 const fmt = (n: number) => n ? n.toFixed(2) : '';
 const normalizeStr = (s: string) => s.toLowerCase().replace(/zapravka|заправка/gi, '').replace(/\s+/g, ' ').trim();
 
-const TrainFuelSystem = () => {
+const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
+  const router = useRouter();
   const [rows, setRows] = useState<FuelRecord[]>([]);
   const [staffList, setStaffList] = useState<Staff[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
@@ -114,9 +118,21 @@ const TrainFuelSystem = () => {
   const [mobileExportRows, setMobileExportRows] = useState<FuelRecord[]>([]);
   const mobileExportRef = useRef<HTMLDivElement | null>(null);
   const currentDateRef = useRef(new Date().toISOString().split('T')[0]);
+  const [isAdminAuthOpen, setIsAdminAuthOpen] = useState(false);
+  const [adminPasswordInput, setAdminPasswordInput] = useState('');
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatInput, setChatInput] = useState('');
+  const [chatMessages, setChatMessages] = useState<Array<{ id: string; text: string; role: 'admin' | 'user'; createdAt: number }>>([]);
+  const [editingChatId, setEditingChatId] = useState<string | null>(null);
+  const [editingChatText, setEditingChatText] = useState('');
+  const [chatButtonPos, setChatButtonPos] = useState({ x: 0, y: 0 });
+  const chatDragRef = useRef({ dragging: false, moved: false, offsetX: 0, offsetY: 0 });
 
   useEffect(() => {
     setIsMounted(true);
+    if (typeof window !== 'undefined') {
+      setChatButtonPos({ x: window.innerWidth - 68, y: window.innerHeight - 86 });
+    }
   }, []);
   useEffect(() => {
     const unsubRows = onSnapshot(query(collection(db, 'fuelRecords'), orderBy('createdAt', 'desc')), (snap) => {
@@ -167,8 +183,76 @@ const TrainFuelSystem = () => {
       document.body.style.color = isDarkMode ? '#e2e8f0' : '#1a1a2e';
     }
   }, [isDarkMode]);
+  useEffect(() => {
+    const unsubChat = onSnapshot(query(collection(db, 'chatMessages'), orderBy('createdAt', 'asc')), (snap) => {
+      const data: Array<{ id: string; text: string; role: 'admin' | 'user'; createdAt: number }> = snap.docs.map((d) => {
+        const v = d.data() as { text?: string; role?: 'admin' | 'user'; createdAt?: number };
+        return {
+          id: d.id,
+          text: String(v.text || ''),
+          role: v.role === 'admin' ? 'admin' : 'user',
+          createdAt: Number(v.createdAt || 0)
+        };
+      });
+      setChatMessages(data);
+    });
+    return () => unsubChat();
+  }, []);
 
   const closeModal = () => { setIsModalOpen(false); setSelectedErju(''); setSelectedZapravka(''); setNewStaffName(''); setNewStaffTabel(''); setEditingStaffId(null); };
+  const sendChatMessage = async () => {
+    const text = chatInput.trim();
+    if (!text) return;
+    await addDoc(collection(db, 'chatMessages'), { text, role: isAdmin ? 'admin' : 'user', createdAt: Date.now() });
+    setChatInput('');
+  };
+  const clearChatMessages = async () => {
+    const ok = window.confirm("Suhbatni tozalashni tasdiqlaysizmi?");
+    if (!ok) return;
+    const snap = await getDocs(collection(db, 'chatMessages'));
+    const batch = writeBatch(db);
+    snap.docs.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
+  };
+  const saveChatEdit = async () => {
+    const text = editingChatText.trim();
+    if (!editingChatId || !text) return;
+    await updateDoc(doc(db, 'chatMessages', editingChatId), { text });
+    setEditingChatId(null);
+    setEditingChatText('');
+  };
+  const deleteChatMessage = async (id: string) => {
+    await deleteDoc(doc(db, 'chatMessages', id));
+    if (editingChatId === id) {
+      setEditingChatId(null);
+      setEditingChatText('');
+    }
+  };
+  const onChatPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    chatDragRef.current = {
+      dragging: true,
+      moved: false,
+      offsetX: e.clientX - rect.left,
+      offsetY: e.clientY - rect.top
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onChatPointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (!chatDragRef.current.dragging) return;
+    const nextX = Math.min(Math.max(8, e.clientX - chatDragRef.current.offsetX), Math.max(8, window.innerWidth - 56));
+    const nextY = Math.min(Math.max(8, e.clientY - chatDragRef.current.offsetY), Math.max(8, window.innerHeight - 56));
+    if (Math.abs(nextX - chatButtonPos.x) > 2 || Math.abs(nextY - chatButtonPos.y) > 2) {
+      chatDragRef.current.moved = true;
+    }
+    setChatButtonPos({ x: nextX, y: nextY });
+  };
+  const onChatPointerUp = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (!chatDragRef.current.dragging) return;
+    chatDragRef.current.dragging = false;
+    e.currentTarget.releasePointerCapture(e.pointerId);
+    if (!chatDragRef.current.moved) setIsChatOpen(v => !v);
+  };
   const handleErjuSelect = (name: string) => { setSelectedErju(name); setSelectedZapravka(''); setNewStaffName(''); setNewStaffTabel(''); setEditingStaffId(null); };
   const addStaff = async () => {
     if (!selectedErju || !selectedZapravka || !newStaffName.trim() || !newStaffTabel.trim()) return;
@@ -564,15 +648,11 @@ const TrainFuelSystem = () => {
       {/* ── TOP NAV BAR ─────────────────────────────────────────────────── */}
       <header className={`sticky top-0 z-50 ${t.headerBg} px-3 sm:px-6 py-2.5`}>
         <div className="max-w-screen-2xl mx-auto flex items-center justify-between gap-2">
-          {/* Left: nav buttons — scroll horizontally on mobile */}
           <div className="flex items-center gap-1.5 overflow-x-auto hide-scrollbar pb-0.5 flex-1 min-w-0">
-            {[
+            {isAdmin ? ([
               { icon: '👥', label: 'Xodimlar', action: () => setIsModalOpen(true) },
-              { icon: '📦', label: 'Toplin', action: () => setIsSkladOpen(true) },
-              { icon: '🚆', label: 'Harakat', action: () => setIsMoveModalOpen(true) },
               { icon: '📅', label: 'Taqvim', action: () => setIsCalendarOpen(true) },
-              { icon: '🧩', label: 'Rusum', action: () => setIsSeriesModalOpen(true) },
-            ].map(b => (
+            ]).map(b => (
               <button
                 key={b.label}
                 type="button"
@@ -582,21 +662,86 @@ const TrainFuelSystem = () => {
                 <span className="text-sm leading-none">{b.icon}</span>
                 <span className="hidden xs:inline sm:inline">{b.label}</span>
               </button>
-            ))}
+            )) : (
+              [
+                { icon: '📦', label: 'Toplin', action: () => setIsSkladOpen(true) },
+                { icon: '🚆', label: 'Harakat', action: () => setIsMoveModalOpen(true) },
+                { icon: '🧩', label: 'Rusum', action: () => setIsSeriesModalOpen(true) },
+              ].map(b => (
+                <button
+                  key={b.label}
+                  type="button"
+                  onClick={b.action}
+                  className={`flex items-center gap-1 text-xs font-semibold px-2.5 py-1.5 rounded-lg whitespace-nowrap transition-all active:scale-95 ${t.navBtn}`}
+                >
+                  <span className="text-sm leading-none">{b.icon}</span>
+                  <span className="hidden xs:inline sm:inline">{b.label}</span>
+                </button>
+              ))
+            )}
           </div>
-          {/* Right: theme toggle */}
-          <button
-            type="button"
-            onClick={() => setIsDarkMode(p => !p)}
-            title={isDarkMode ? "Kunduzgi rejim" : "Tungi rejim"}
-            className={`flex items-center justify-center w-9 h-9 rounded-lg flex-shrink-0 text-base transition-all active:scale-95 ${t.navBtn}`}
-          >
-            {isDarkMode ? '☀️' : '🌙'}
-          </button>
+          <div className="flex items-center gap-2">
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => router.push('/')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-95 ${t.navBtn}`}
+              >
+                User panel
+              </button>
+            )}
+            {!isAdmin && (
+              <button
+                type="button"
+                onClick={() => setIsAdminAuthOpen(true)}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-95 bg-gradient-to-r from-fuchsia-600 to-violet-600 hover:from-fuchsia-500 hover:to-violet-500 text-white border border-fuchsia-300/40 shadow-md shadow-fuchsia-700/25"
+              >
+                Admin
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setIsDarkMode(p => !p)}
+              title={isDarkMode ? "Kunduzgi rejim" : "Tungi rejim"}
+              className={`flex items-center justify-center w-9 h-9 rounded-lg flex-shrink-0 text-base transition-all active:scale-95 ${t.navBtn}`}
+            >
+              {isDarkMode ? '☀️' : '🌙'}
+            </button>
+          </div>
         </div>
       </header>
 
       <main className="max-w-screen-2xl mx-auto px-3 sm:px-6 py-4 sm:py-6 space-y-4 sm:space-y-6">
+        {isAdmin && (
+          <section className={`${t.tableBg} rounded-2xl p-3 sm:p-4`}>
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <h2 className={`text-sm sm:text-base font-bold ${isDarkMode ? 'text-cyan-200' : 'text-indigo-800'}`}>Bugungi user yozuvlari (real-time)</h2>
+              <span className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{rows.filter(r => r.date === new Date().toISOString().split('T')[0]).length} ta</span>
+            </div>
+            <div className="table-scroll">
+              <table className="w-full text-xs sm:text-sm" style={{ minWidth: '700px' }}>
+                <thead className={isDarkMode ? 'text-slate-300' : 'text-slate-700'}>
+                  <tr>
+                    {['Vaqt', 'Zaprafka', 'Harakat', 'Xodim', "Yoqilg'i"].map(h => (
+                      <th key={h} className={`px-2 py-2 text-left ${isDarkMode ? 'border-b border-white/10' : 'border-b border-slate-200'}`}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.filter(r => r.date === new Date().toISOString().split('T')[0]).map((r) => (
+                    <tr key={`admin-live-${r.id}`} className={t.tableRow}>
+                      <td className="px-2 py-2">{r.time}</td>
+                      <td className="px-2 py-2">{r.supplyPoint}</td>
+                      <td className="px-2 py-2">{r.moveType}</td>
+                      <td className="px-2 py-2">{r.staffName}</td>
+                      <td className="px-2 py-2 text-right font-mono">{Number(r.fuelAmount || 0).toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
 
         {/* ── FORM CARD ─────────────────────────────────────────────────── */}
         <section className={`${t.formCard} rounded-2xl p-4 sm:p-6`}>
@@ -1217,6 +1362,100 @@ const TrainFuelSystem = () => {
           </div>
         )}
 
+        {isAdminAuthOpen && !isAdmin && (
+          <div className="fixed inset-0 z-[10030] flex items-center justify-center p-4">
+            <div className="absolute inset-0 bg-black/60" onClick={() => setIsAdminAuthOpen(false)} />
+            <div className={`relative ${t.modalBg} w-full max-w-sm rounded-2xl p-4`}>
+              <h3 className={`text-sm font-bold mb-2 ${t.modalTitle}`}>Admin kirish</h3>
+              <input
+                type="password"
+                value={adminPasswordInput}
+                onChange={(e) => setAdminPasswordInput(e.target.value)}
+                placeholder="Parol kiriting..."
+                className={`${t.panelInput} w-full rounded-lg px-3 py-2 text-sm outline-none`}
+              />
+              <div className="flex justify-end gap-2 mt-3">
+                <button type="button" onClick={() => setIsAdminAuthOpen(false)} className={`px-3 py-2 rounded-lg text-xs font-semibold ${isDarkMode ? 'bg-slate-700 text-slate-200' : 'bg-slate-200 text-slate-700'}`}>Bekor</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (adminPasswordInput === '1985') {
+                      setAdminPasswordInput('');
+                      setIsAdminAuthOpen(false);
+                      router.push('/admin');
+                    } else {
+                      alert('Parol noto‘g‘ri');
+                    }
+                  }}
+                  className="px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white"
+                >
+                  Kirish
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <button
+          type="button"
+          onPointerDown={onChatPointerDown}
+          onPointerMove={onChatPointerMove}
+          onPointerUp={onChatPointerUp}
+          className="fixed z-[10040] w-12 h-12 rounded-full bg-fuchsia-600 hover:bg-fuchsia-500 text-white shadow-xl text-lg touch-none"
+          style={{ left: `${chatButtonPos.x}px`, top: `${chatButtonPos.y}px` }}
+          title="Suhbat"
+        >
+          💬
+        </button>
+        {isChatOpen && (
+          <div className={`fixed z-[10041] w-[320px] max-w-[calc(100vw-1rem)] rounded-2xl overflow-hidden ${t.modalBg}`}
+            style={{ left: `${Math.max(8, Math.min(chatButtonPos.x - 264, window.innerWidth - 330))}px`, top: `${Math.max(8, chatButtonPos.y - 330)}px` }}>
+            <div className={`px-3 py-2 flex items-center justify-between ${t.modalHeader}`}>
+              <span className={`text-xs font-bold ${t.modalTitle}`}>User/Admin Chat</span>
+              <div className="flex items-center gap-1">
+                <button onClick={clearChatMessages} className="text-[10px] px-2 py-1 rounded bg-rose-600 text-white">Tozalash</button>
+                <button onClick={() => setIsChatOpen(false)} className="text-xs px-2">✖</button>
+              </div>
+            </div>
+            <div className="h-64 overflow-y-auto p-2 space-y-2">
+              {chatMessages.map((m) => (
+                <div key={m.id} className={`px-2 py-1.5 rounded-lg text-xs ${m.role === 'admin' ? 'bg-blue-600/20 text-blue-200' : 'bg-emerald-600/20 text-emerald-200'}`}>
+                  <div className="font-semibold mb-0.5">{m.role === 'admin' ? 'Admin' : 'User'}</div>
+                  {editingChatId === m.id ? (
+                    <div className="space-y-1">
+                      <input
+                        value={editingChatText}
+                        onChange={(e) => setEditingChatText(e.target.value)}
+                        className={`${t.panelInput} w-full rounded px-2 py-1 text-xs`}
+                      />
+                      <div className="flex gap-1">
+                        <button onClick={saveChatEdit} className="text-[10px] px-2 py-1 rounded bg-emerald-600 text-white">Saqlash</button>
+                        <button onClick={() => { setEditingChatId(null); setEditingChatText(''); }} className="text-[10px] px-2 py-1 rounded bg-slate-600 text-white">Bekor</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div>{m.text}</div>
+                  )}
+                  <div className="flex justify-end gap-1 mt-1">
+                    <button onClick={() => { setEditingChatId(m.id); setEditingChatText(m.text); }} className="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white">Edit</button>
+                    <button onClick={() => deleteChatMessage(m.id)} className="text-[10px] px-2 py-0.5 rounded bg-rose-600 text-white">Del</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="p-2 border-t border-white/10 flex gap-2">
+              <input
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && sendChatMessage()}
+                placeholder="Xabar yozing..."
+                className={`${t.panelInput} flex-1 rounded-lg px-2 py-1.5 text-xs outline-none`}
+              />
+              <button onClick={sendChatMessage} className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold">Yuborish</button>
+            </div>
+          </div>
+        )}
+
         <RentCalendar
           isOpen={isCalendarOpen}
           onClose={() => setIsCalendarOpen(false)}
@@ -1259,4 +1498,8 @@ const FormInput = ({ label, type = 'text', value, onChange, theme, labelClass, p
   </div>
 );
 
-export default TrainFuelSystem;
+export { TrainFuelSystem };
+
+export default function UserPage() {
+  return <TrainFuelSystem isAdmin={false} />;
+}
