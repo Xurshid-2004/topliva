@@ -35,6 +35,23 @@ interface ClosedDayMeta {
   closedAt: number;
 }
 
+interface AdminAuthConfig {
+  password?: string;
+  updatedAt?: number;
+}
+
+type MainFormFieldKey =
+  | 'supplyPoint'
+  | 'locoSeries'
+  | 'locoCode'
+  | 'moveType'
+  | 'locoNumber'
+  | 'trainNumber'
+  | 'weight'
+  | 'staffName'
+  | 'balanceBefore'
+  | 'fuelAmount';
+
 const ERJU_DATA = [
   { name: 'Toshkent ERJU', short: 'Тошкент', zapravkalar: ['Toshkent zapravka', 'Angren zapravka', 'Sirdaryo zapravka', 'Xovos zapravka', 'Jizzax zapravka'] },
   { name: 'Buxoro ERJU', short: 'Бухара', zapravkalar: ['Samarqand zapravka', 'Ziyouddin zapravka', 'Tinchlik zapravka', 'Buxoro zapravka', 'Uchquduq zapravka'] },
@@ -65,8 +82,37 @@ const skladOptions = [
   { key: '19', value: 'Darband' }, { key: '26', value: "Qumqo'rg'on" },
 ];
 
-const fmt = (n: number) => n ? n.toFixed(2) : '';
+const roundAmount = (n: number) => Math.round((n + Number.EPSILON) * 1000) / 1000;
+const parseAmount = (value: string | number | undefined | null) => {
+  if (typeof value === 'number') return Number.isFinite(value) ? roundAmount(value) : 0;
+  const normalized = String(value ?? '').trim().replace(/\s+/g, '').replace(',', '.');
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? roundAmount(parsed) : 0;
+};
+const formatAmount = (value: string | number | undefined | null) => {
+  const amount = typeof value === 'number' ? roundAmount(value) : parseAmount(value);
+  return amount.toLocaleString('ru-RU', { maximumFractionDigits: 3, minimumFractionDigits: 0 });
+};
+const fmt = (n: number) => n ? formatAmount(n) : '';
 const normalizeStr = (s: string) => s.toLowerCase().replace(/zapravka|заправка/gi, '').replace(/\s+/g, ' ').trim();
+const isCargoMoveType = (moveType: string | undefined) => {
+  const normalized = String(moveType || '').toLowerCase();
+  return /груз|gruz|yuk/.test(normalized)
+    && !/маневр|manevr|bo['’`]?sh|бош|ремонт|pass|пассаж|arenda|аренда|пригород/.test(normalized);
+};
+const isLoadedMoveType = (moveType: string | undefined) => /ortildi|ортил|yuk ort|loading|mahalliy/.test(String(moveType || '').toLowerCase());
+const MAIN_FORM_FIELD_ORDER: MainFormFieldKey[] = [
+  'supplyPoint',
+  'locoSeries',
+  'locoCode',
+  'moveType',
+  'locoNumber',
+  'trainNumber',
+  'weight',
+  'staffName',
+  'balanceBefore',
+  'fuelAmount',
+];
 
 const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
   const router = useRouter();
@@ -116,10 +162,16 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
   const [mobileExportTitle, setMobileExportTitle] = useState('');
   const [mobileExportType, setMobileExportType] = useState<'pdf' | 'erju'>('pdf');
   const [mobileExportRows, setMobileExportRows] = useState<FuelRecord[]>([]);
+  const [mobileExportDocumentTitle, setMobileExportDocumentTitle] = useState('');
   const mobileExportRef = useRef<HTMLDivElement | null>(null);
   const currentDateRef = useRef(new Date().toISOString().split('T')[0]);
   const [isAdminAuthOpen, setIsAdminAuthOpen] = useState(false);
   const [adminPasswordInput, setAdminPasswordInput] = useState('');
+  const [adminPassword, setAdminPassword] = useState('1985');
+  const [isAdminPasswordModalOpen, setIsAdminPasswordModalOpen] = useState(false);
+  const [currentAdminPasswordInput, setCurrentAdminPasswordInput] = useState('');
+  const [newAdminPasswordInput, setNewAdminPasswordInput] = useState('');
+  const [confirmAdminPasswordInput, setConfirmAdminPasswordInput] = useState('');
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatInput, setChatInput] = useState('');
   const [chatMessages, setChatMessages] = useState<Array<{ id: string; text: string; role: 'admin' | 'user'; createdAt: number }>>([]);
@@ -127,6 +179,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
   const [editingChatText, setEditingChatText] = useState('');
   const [chatButtonPos, setChatButtonPos] = useState({ x: 0, y: 0 });
   const chatDragRef = useRef({ dragging: false, moved: false, offsetX: 0, offsetY: 0 });
+  const mainFormFieldRefs = useRef<Partial<Record<MainFormFieldKey, HTMLInputElement | null>>>({});
 
   useEffect(() => {
     setIsMounted(true);
@@ -165,12 +218,18 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
       setClosedDaysMeta(metas);
       setClosedDates(metas.map(m => m.date));
     });
+    const unsubAdminAuth = onSnapshot(doc(db, 'appConfig', 'adminAuth'), (snap) => {
+      const payload = (snap.data() || {}) as AdminAuthConfig;
+      const nextPassword = String(payload.password || '').trim();
+      if (nextPassword) setAdminPassword(nextPassword);
+    });
     return () => {
       unsubRows();
       unsubStaff();
       unsubMoves();
       unsubSeries();
       unsubClosed();
+      unsubAdminAuth();
     };
   }, []);
   useEffect(() => { document.body.style.overflow = isModalOpen ? 'hidden' : 'unset'; return () => { document.body.style.overflow = 'unset'; }; }, [isModalOpen]);
@@ -357,35 +416,96 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     () => rows.filter(r => r.date === activeEntryDate && !closedDates.includes(r.date)),
     [rows, closedDates, activeEntryDate]
   );
-  const stats = useMemo(() => ({ total: visibleRows.reduce((s, r) => s + (Number(r.balanceBefore) || 0) + (Number(r.fuelAmount) || 0), 0) }), [visibleRows]);
+  const stats = useMemo(() => ({ total: visibleRows.reduce((s, r) => roundAmount(s + parseAmount(r.balanceBefore) + parseAmount(r.fuelAmount)), 0) }), [visibleRows]);
   const formatDate = (d: Date) => `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${d.getFullYear()}`;
+  const formatDateRangeTitle = (start: Date | null, end: Date | null) => {
+    const [y, m, d] = activeEntryDate.split('-').map(Number);
+    const fallbackDate = new Date(y, (m || 1) - 1, d || 1);
+    const startLabel = start ? formatDate(start) : formatDate(fallbackDate);
+    const endLabel = end ? formatDate(end) : startLabel;
+    if (startLabel === endLabel) {
+      return `${startLabel} kun mobaynida tarqatilgan dizel yoqilg'isi tarqatilishi haqida ma'lumot`;
+    }
+    return `${startLabel} dan ${endLabel} gacha tarqatilgan dizel yoqilg'isi tarqatilishi haqida ma'lumot`;
+  };
+  const formatErjuDateRangeTitle = (start: Date | null, end: Date | null) => {
+    const [y, m, d] = activeEntryDate.split('-').map(Number);
+    const fallbackDate = new Date(y, (m || 1) - 1, d || 1);
+    const startLabel = start ? formatDate(start) : formatDate(fallbackDate);
+    const endLabel = end ? formatDate(end) : startLabel;
+    if (startLabel === endLabel) {
+      return `${startLabel} sutkasi mobaynida dizel yoqilg'isi tarqatilishi haqida MA'LUMOTNOMA`;
+    }
+    return `${startLabel} dan ${endLabel} gacha dizel yoqilg'isi tarqatilishi haqida MA'LUMOTNOMA`;
+  };
   const getZapravkaByStaff = (name: string | undefined) => { if (!name) return ''; const s = staffList.find(x => x.fullName === name); return s ? s.zapravka : ''; };
+  const setMainFormFieldRef = (field: MainFormFieldKey) => (node: HTMLInputElement | null) => {
+    mainFormFieldRefs.current[field] = node;
+  };
+  const focusMainFormField = (field: MainFormFieldKey) => {
+    const input = mainFormFieldRefs.current[field];
+    if (!input) return;
+    input.focus();
+    if (input.type !== 'number') input.select();
+  };
+  const moveMainFormFocus = (field: MainFormFieldKey, direction: -1 | 1) => {
+    const currentIndex = MAIN_FORM_FIELD_ORDER.indexOf(field);
+    if (currentIndex === -1) return;
+    const nextField = MAIN_FORM_FIELD_ORDER[currentIndex + direction];
+    if (!nextField) return;
+    focusMainFormField(nextField);
+  };
+  const handleMainFormArrowKey = (field: MainFormFieldKey) => (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (typeof window === 'undefined' || !window.matchMedia('(pointer: fine)').matches) return;
+    if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      moveMainFormFocus(field, 1);
+    }
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      moveMainFormFocus(field, -1);
+    }
+  };
+  const autoAdvanceMainFormField = (field: MainFormFieldKey, nextValue: string) => {
+    if (nextValue.trim().length !== 4) return;
+    requestAnimationFrame(() => moveMainFormFocus(field, 1));
+  };
 
-  const handleExportPdf = (sourceRows: FuelRecord[] = visibleRows) => {
+  const handleExportPdf = (
+    sourceRows: FuelRecord[] = visibleRows,
+    reportTitle = formatDateRangeTitle(null, null)
+  ) => {
     const printWindow = window.open('', '_blank');
     if (!printWindow) return;
-    const today = formatDate(new Date());
-    const title = `${today} kun mobaynida tarqatilgan dizel yoqilg'isi tarqatilishi haqida ma'lumot`;
+    const cargoRows = sourceRows.filter(r => isCargoMoveType(r.moveType) && parseAmount(r.weight) > 0);
+    const totalCargoWeight = cargoRows.reduce((sum, row) => roundAmount(sum + parseAmount(row.weight)), 0);
+    const loadedWeight = cargoRows.reduce((sum, row) => roundAmount(sum + (isLoadedMoveType(row.moveType) ? parseAmount(row.weight) : 0)), 0);
+    const transitWeight = roundAmount(Math.max(0, totalCargoWeight - loadedWeight));
     const grouped = sourceRows
       .map((r): FuelRecord & { _zap: string } => { const zap = getZapravkaByStaff(r.staffName); return { ...r, _zap: zap }; })
       .sort((a, b) => { const z = (a._zap||'').localeCompare(b._zap||''); if(z!==0)return z; const s=(a.staffName||'').localeCompare(b.staffName||''); if(s!==0)return s; return (a.time||'').localeCompare(b.time||''); })
       .reduce((acc: Record<string, (FuelRecord & { _zap: string })[]>, r) => { const key=`${r._zap||''}|||${r.staffName||''}`; if(!acc[key])acc[key]=[]; acc[key].push(r); return acc; }, {});
-    const tableHeader = `<thead><tr><th>№</th><th>Vaqt</th><th>Poyezd rusumi</th><th>Raqami</th><th>Harakat turi</th><th>P.Raqami</th><th>Harakat ruxsat indexi</th><th>Poyezd Vazni</th><th>Qoldiq</th><th>Yoqilg'i</th><th>Hisob</th></tr></thead>`;
-    const tablesHtml = Object.entries(grouped).map(([key, group]) => {
+    const totalBalance = sourceRows.reduce((sum, row) => roundAmount(sum + parseAmount(row.balanceBefore)), 0);
+    const totalFuel = sourceRows.reduce((sum, row) => roundAmount(sum + parseAmount(row.fuelAmount)), 0);
+    const totalAmount = roundAmount(totalBalance + totalFuel);
+    const bodyRows = Object.entries(grouped).map(([key, group]) => {
       const [zap, staff] = key.split('|||');
-      const rowsHtml = group.map((r, i) => `<tr><td>${i+1}</td><td>${r.time||''}</td><td>${r.locoSeries||''}</td><td>${r.trainIndex||''}</td><td>${r.moveType||''}</td><td>${r.locoNumber||''}</td><td>${r.trainNumber||''}</td><td>${r.weight||''}</td><td>${r.balanceBefore||''}</td><td>${r.fuelAmount||''}</td><td>${(Number(r.balanceBefore)+Number(r.fuelAmount))||''}</td></tr>`).join('');
+      const rowsHtml = group.map((r) => `<tr class="data-row"><td>${r.time||''}</td><td>${r.locoSeries||''}</td><td>${r.locoCode||''}</td><td>${r.moveType||''}</td><td>${r.locoNumber||''}</td><td>${r.trainNumber||''}</td><td class="num">${r.weight||''}</td><td class="num">${formatAmount(r.balanceBefore)}</td><td class="num">${formatAmount(r.fuelAmount)}</td><td class="num">${formatAmount(roundAmount(parseAmount(r.balanceBefore) + parseAmount(r.fuelAmount)))}</td></tr>`).join('');
       const cleanZap = (zap||'').replace(/\s*zapravka\s*/i,'').trim();
-      return `<div class="group-title">${cleanZap||'-'} — ${staff||'-'}</div><table>${tableHeader}<tbody>${rowsHtml}</tbody></table>`;
+      return `<tr class="group-row"><td colspan="10">${cleanZap||'-'} - ${staff||'-'}</td></tr>${rowsHtml}`;
     }).join('');
-    printWindow.document.write(`<html><head><title>PDF</title><style>*{box-sizing:border-box;}body{font-family:Arial,sans-serif;color:#111;padding:24px;}h1{font-size:14px;font-weight:700;text-align:center;margin:0 0 12px;}.group-title{font-size:11px;font-weight:700;margin:10px 0 4px;}table{width:100%;border-collapse:collapse;font-size:10px;margin-bottom:10px;}th,td{border:1px solid #999;padding:4px 6px;text-align:center;}thead th{background:#f3f3f3;}</style></head><body><h1>${title}</h1>${tablesHtml}</body></html>`);
-    printWindow.document.close(); printWindow.focus(); printWindow.print();
+    printWindow.document.write(`<html><head><title>PDF</title><meta charset="utf-8"/><style>@page{size:A4 portrait;margin:8mm 9mm;}*{box-sizing:border-box;}body{font-family:Arial,sans-serif;color:#111;margin:0;padding:0;}.sheet{width:95%;margin:0 auto;}table{width:100%;border-collapse:collapse;table-layout:fixed;border:1px solid #555;font-size:9.4px;}thead{display:table-header-group;}th{border:1px solid #666;padding:3px 2px;text-align:center;vertical-align:middle;font-weight:700;line-height:1.1;background:#f5f5f5;}td{padding:1px 3px;text-align:center;vertical-align:middle;line-height:1.15;}tbody td{border:none;}tbody tr{page-break-inside:avoid;}.title-row th{font-size:10.5px;font-weight:700;padding:5px 4px;background:#fff;}.group-head th{font-size:9.5px;}.sub-head th{font-size:8.8px;}.num-head th{font-size:8.5px;padding:2px 0;background:#fff;}.group-row td{padding:6px 3px 3px 10px;text-align:left;font-size:10.3px;font-weight:700;}.group-row:not(:first-child) td{padding-top:9px;}.data-row td:first-child{text-align:left;}.num{text-align:right;}.cargo-box{width:95%;margin:8px auto 8px;display:flex;justify-content:flex-start;gap:10px;align-items:flex-start;flex-wrap:wrap;}.cargo-item{min-width:110px;padding:4px 8px;border:1px solid #666;background:#fafafa;font-size:9px;}.cargo-item strong{display:block;font-size:10px;margin-bottom:2px;}.cargo-note{font-size:8.6px;font-weight:700;align-self:center;}.summary-box{width:95%;margin:10px auto 0;display:flex;justify-content:flex-end;}.summary-table{width:220px;border-collapse:collapse;font-size:9.4px;}.summary-table td{border:1px solid #666;padding:4px 6px;}.summary-table td:last-child{text-align:right;font-weight:700;}col.c1{width:7%;}col.c2{width:9%;}col.c3{width:9%;}col.c4{width:11%;}col.c5{width:10%;}col.c6{width:11%;}col.c7{width:10%;}col.c8{width:11%;}col.c9{width:8%;}col.c10{width:9%;}</style></head><body><div class="sheet"><table><colgroup><col class="c1"/><col class="c2"/><col class="c3"/><col class="c4"/><col class="c5"/><col class="c6"/><col class="c7"/><col class="c8"/><col class="c9"/><col class="c10"/></colgroup><thead><tr class="title-row"><th colspan="10">${reportTitle}</th></tr><tr class="group-head"><th rowspan="2">Vaqt</th><th colspan="2">Teplovozlar bo'yicha ma'lumot</th><th colspan="4">Poyezdlar va tashkilotlar bo'yicha ma'lumot</th><th rowspan="2">Qoldiq</th><th rowspan="2">B.yoqilg'i</th><th rowspan="2">Hisob</th></tr><tr class="sub-head"><th>Poyezd rusumi</th><th>Raqami</th><th>Harakat turi</th><th>P.Raqami</th><th>Ruxsat indexi</th><th>Poyezd vazni</th></tr><tr class="num-head"><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th></tr></thead><tbody>${bodyRows || "<tr class=\"group-row\"><td colspan=\"10\">Ma'lumot yo'q</td></tr>"}</tbody></table></div><div class="cargo-box"><div class="cargo-item"><strong>Umumiy yuk</strong>${formatAmount(totalCargoWeight)}</div><div class="cargo-item"><strong>Ortildi</strong>${formatAmount(loadedWeight)}</div><div class="cargo-item"><strong>Tranzit</strong>${formatAmount(transitWeight)}</div><div class="cargo-note">Tranzit = Umumiy yuk - Ortildi. Faqat yuk harakati hisobga olinadi.</div></div><div class="summary-box"><table class="summary-table"><tbody><tr><td>Jami qoldiq</td><td>${formatAmount(totalBalance)}</td></tr><tr><td>Jami B.yoqilg'i</td><td>${formatAmount(totalFuel)}</td></tr><tr><td>Jami hisob</td><td>${formatAmount(totalAmount)}</td></tr></tbody></table></div></body></html>`);
+    printWindow.document.close();
+    printWindow.focus();
+    setTimeout(() => printWindow.print(), 350);
   };
 
-  const handleExportErjuPdf = (sourceRows: FuelRecord[] = visibleRows) => {
+  const handleExportErjuPdf = (
+    sourceRows: FuelRecord[] = visibleRows,
+    reportTitle = formatErjuDateRangeTitle(null, null)
+  ) => {
     const printWindow = window.open('', '_blank');
     if (!printWindow) return;
-    const today = formatDate(new Date());
-    const title = `${today} sutkasi mobaynida dizel yoqilg'isi tarqatilishi haqida MA'LUMOTNOMA`;
     const moveTypeOrder = moveOptions.map(o => (o.value || '').trim()).filter(Boolean);
     const extraMoves: string[] = [];
     const moveTypeSet = new Set(moveTypeOrder);
@@ -411,7 +531,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
       zapName = cleanZapName(zapName);
       if (!erjuData[erjuName]) erjuData[erjuName] = {};
       if (!erjuData[erjuName][zapName]) erjuData[erjuName][zapName] = { total: 0, moves: {} };
-      const fuel = Number(r.fuelAmount) || 0;
+      const fuel = parseAmount(r.fuelAmount);
       const move = (r.moveType || '').trim() || 'Noma';
       erjuData[erjuName][zapName].total += fuel;
       erjuData[erjuName][zapName].moves[move] = (erjuData[erjuName][zapName].moves[move] || 0) + fuel;
@@ -455,7 +575,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     moveTypes.forEach(mt => { moveTypeData[mt] = {}; ERJU_DATA.forEach(erju => { moveTypeData[mt][erju.name] = 0; }); moveTypeTotals[mt] = 0; });
     sourceRows.forEach(r => {
       const erjuName = findErju(r.supplyPoint || '', r.staffName || '');
-      const fuel = Number(r.fuelAmount) || 0;
+      const fuel = parseAmount(r.fuelAmount);
       const move = (r.moveType || '').trim() || 'Noma';
       if (moveTypeData[move]) { moveTypeData[move][erjuName] = (moveTypeData[move][erjuName] || 0) + fuel; moveTypeTotals[move] += fuel; }
     });
@@ -467,7 +587,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     const moveTypeGrandTotal = Object.values(moveTypeTotals).reduce((a, b) => a + b, 0);
     const moveTypeGrandRow = `<tr class="grand-r"><td class="left" style="font-weight:800">Jami</td>${moveTypeGrandCells}<td class="num grand-num">${fmt(moveTypeGrandTotal)}</td></tr>`;
     const totalLocos = new Set(sourceRows.filter(r => r.locoSeries || r.locoNumber).map(r => `${r.locoSeries}-${r.locoNumber}`)).size;
-    printWindow.document.write(`<html><head><title>ERJU MA'LUMOTNOMA</title><meta charset="utf-8"/><style>*{box-sizing:border-box;}body{font-family:Arial,sans-serif;font-size:9px;color:#000;padding:16px;}h1{font-size:10px;font-weight:800;text-align:center;margin:0 0 12px;text-transform:uppercase;letter-spacing:0.5px;}.main-table{width:100%;border-collapse:collapse;margin-bottom:20px;}.main-table th{border:1px solid #444;padding:4px 3px;text-align:center;background:#f0f0f0;font-size:9px;font-weight:700;vertical-align:middle;}.main-table td{border:1px solid #666;padding:3px 4px;text-align:center;vertical-align:middle;font-size:9px;}.main-table td.left{text-align:left;font-weight:700;font-size:9.5px;}.main-table td.num{text-align:right;font-family:'Courier New',monospace;font-weight:700;}.erju-header .erju-title{background:#d9d9d9;color:#000;font-weight:800;font-size:10px;text-align:left;padding:5px 6px;}.sub-row td{background:#eeeeee;font-weight:700;font-size:9px;border-color:#555;}.sub-row .sub-num{text-align:right;font-family:'Courier New',monospace;font-weight:700;}.sub-row .sub-label{font-weight:800;}.grand-row td{background:#cccccc;color:#000;font-weight:800;font-size:9px;border-color:#333;}.grand-row .grand-num{text-align:right;font-family:'Courier New',monospace;font-weight:700;}.grand-row .grand-label{text-align:left;font-weight:800;}.summary-title{font-size:9px;font-weight:800;margin:8px 0 5px;text-transform:uppercase;}.sum-table{width:100%;border-collapse:collapse;margin-bottom:10px;}.sum-table th{border:1px solid #555;padding:4px 5px;text-align:center;background:#f0f0f0;font-size:9px;font-weight:700;}.sum-table td{border:1px solid #666;padding:3px 5px;font-size:9px;}.sum-table td.left{text-align:left;font-weight:700;}.sum-table td.num{text-align:right;font-family:'Courier New',monospace;font-weight:700;}.sum-table .grand-r td{background:#cccccc;font-weight:800;}.stat-line{font-size:9px;font-weight:700;margin-top:6px;}</style></head><body><h1>${title}</h1><table class="main-table"><thead><tr><th rowspan="2" style="width:24px">№</th><th rowspan="2" style="min-width:90px">Yo'nig'i ombori</th><th rowspan="2">t sutkada tarqatigan</th><th rowspan="2">Jami teplovozlarga tarqatigan</th><th colspan="${moveTypes.length}">Shu jumladan:</th></tr><tr>${moveTypes.map(m => `<th>${m}</th>`).join('')}</tr></thead><tbody>${mainTableRows}${grandRow}</tbody></table><div class="summary-title">Harakat turi bo'yicha hisob-kitob</div><table class="sum-table"><thead><tr><th class="left">Harakat turi</th>${ERJU_DATA.map(e => `<th>${e.short}</th>`).join('')}<th>Jami</th></tr></thead><tbody>${moveTypeSummaryRows}${moveTypeGrandRow}</tbody></table><div class="stat-line" style="margin-top:15px;">Jami teplovozlar soni: ${totalLocos} ta | Jami yozuvlar: ${sourceRows.length} ta</div></body></html>`);
+    printWindow.document.write(`<html><head><title>ERJU MA'LUMOTNOMA</title><meta charset="utf-8"/><style>*{box-sizing:border-box;}body{font-family:Arial,sans-serif;font-size:9px;color:#000;padding:14px;}h1{font-size:10px;font-weight:800;text-align:center;margin:0 0 12px;text-transform:uppercase;letter-spacing:0.4px;}.main-table{width:100%;border-collapse:collapse;margin-bottom:20px;table-layout:fixed;}.main-table th{border:1px solid #444;padding:4px 2px;text-align:center;background:#f0f0f0;font-size:8.6px;font-weight:700;vertical-align:middle;line-height:1.15;word-break:break-word;}.main-table td{border:1px solid #666;padding:3px 4px;text-align:center;vertical-align:middle;font-size:8.8px;word-break:break-word;}.main-table td.left{text-align:left;font-weight:700;font-size:9.2px;}.main-table td.num{text-align:right;font-family:'Courier New',monospace;font-weight:700;}.erju-header .erju-title{background:#d9d9d9;color:#000;font-weight:800;font-size:9.6px;text-align:left;padding:5px 6px;}.sub-row td{background:#eeeeee;font-weight:700;font-size:8.8px;border-color:#555;}.sub-row .sub-num{text-align:right;font-family:'Courier New',monospace;font-weight:700;}.sub-row .sub-label{font-weight:800;}.grand-row td{background:#cccccc;color:#000;font-weight:800;font-size:8.8px;border-color:#333;}.grand-row .grand-num{text-align:right;font-family:'Courier New',monospace;font-weight:700;}.grand-row .grand-label{text-align:left;font-weight:800;}.summary-title{font-size:9px;font-weight:800;margin:8px 0 5px;text-transform:uppercase;}.sum-table{width:100%;border-collapse:collapse;margin-bottom:10px;table-layout:fixed;}.sum-table th{border:1px solid #555;padding:4px 4px;text-align:center;background:#f0f0f0;font-size:8.8px;font-weight:700;word-break:break-word;}.sum-table td{border:1px solid #666;padding:3px 5px;font-size:8.8px;word-break:break-word;}.sum-table td.left{text-align:left;font-weight:700;}.sum-table td.num{text-align:right;font-family:'Courier New',monospace;font-weight:700;}.sum-table .grand-r td{background:#cccccc;font-weight:800;}.stat-line{font-size:9px;font-weight:700;margin-top:6px;}.main-col-num{width:4%;}.main-col-label{width:16%;}.main-col-day{width:10%;}.main-col-total{width:11%;}.sum-col-label{width:19%;}</style></head><body><h1>${reportTitle}</h1><table class="main-table"><colgroup><col class="main-col-num"/><col class="main-col-label"/><col class="main-col-day"/><col class="main-col-total"/>${moveTypes.map(() => '<col/>').join('')}</colgroup><thead><tr><th rowspan="2">№</th><th rowspan="2">Yo'nig'i ombori</th><th rowspan="2">1 sutkada tarqatigan</th><th rowspan="2">Jami teplovozlarga tarqatigan</th><th colspan="${moveTypes.length}">Shu jumladan:</th></tr><tr>${moveTypes.map(m => `<th>${m}</th>`).join('')}</tr></thead><tbody>${mainTableRows}${grandRow}</tbody></table><div class="summary-title">Harakat turi bo'yicha hisob-kitob</div><table class="sum-table"><colgroup><col class="sum-col-label"/>${ERJU_DATA.map(() => '<col/>').join('')}<col/></colgroup><thead><tr><th class="left">Harakat turi</th>${ERJU_DATA.map(e => `<th>${e.short}</th>`).join('')}<th>Jami</th></tr></thead><tbody>${moveTypeSummaryRows}${moveTypeGrandRow}</tbody></table><div class="stat-line" style="margin-top:15px;">Jami teplovozlar soni: ${totalLocos} ta | Jami yozuvlar: ${sourceRows.length} ta</div></body></html>`);
     printWindow.document.close();
     printWindow.focus();
     setTimeout(() => printWindow.print(), 500);
@@ -487,13 +607,33 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     });
   };
   const todayRows = rows.filter(r => r.date === activeEntryDate);
-  const todayTotal = todayRows.reduce((s, r) => s + (Number(r.balanceBefore) || 0) + (Number(r.fuelAmount) || 0), 0);
+  const todayTotal = todayRows.reduce((s, r) => roundAmount(s + parseAmount(r.balanceBefore) + parseAmount(r.fuelAmount)), 0);
   const isMobileDevice = () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches;
-  const openMobileExport = (type: 'pdf' | 'erju', sourceRows: FuelRecord[]) => {
+  const openMobileExport = (type: 'pdf' | 'erju', sourceRows: FuelRecord[], documentTitle = formatDateRangeTitle(null, null)) => {
     setMobileExportType(type);
     setMobileExportRows(sourceRows);
-    setMobileExportTitle(type === 'pdf' ? 'PDF ro‘yxat (mobil)' : 'ERJU PDF ro‘yxat (mobil)');
+    setMobileExportDocumentTitle(documentTitle);
+    setMobileExportTitle(type === 'pdf' ? 'PDF ro‘yxat (mobil)' : 'Y.PDF ro‘yxat (mobil)');
     setIsMobileExportOpen(true);
+  };
+  const closeAdminPasswordModal = () => {
+    setIsAdminPasswordModalOpen(false);
+    setCurrentAdminPasswordInput('');
+    setNewAdminPasswordInput('');
+    setConfirmAdminPasswordInput('');
+  };
+  const saveAdminPassword = async () => {
+    const currentPassword = currentAdminPasswordInput.trim();
+    const nextPassword = newAdminPasswordInput.trim();
+    const confirmPassword = confirmAdminPasswordInput.trim();
+    if (!currentPassword || !nextPassword || !confirmPassword) { alert('Barcha maydonlarni to‘ldiring'); return; }
+    if (currentPassword !== adminPassword) { alert('Joriy parol noto‘g‘ri'); return; }
+    if (nextPassword.length < 4) { alert('Yangi parol kamida 4 ta belgidan iborat bo‘lsin'); return; }
+    if (nextPassword !== confirmPassword) { alert('Yangi parollar bir xil emas'); return; }
+    await setDoc(doc(db, 'appConfig', 'adminAuth'), { password: nextPassword, updatedAt: Date.now() }, { merge: true });
+    setAdminPassword(nextPassword);
+    closeAdminPasswordModal();
+    alert('Admin paroli yangilandi');
   };
   const saveMobileExportAsImage = async () => {
     if (!mobileExportRef.current) return;
@@ -523,10 +663,21 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     setSupplyPointRaw('');
     supplyPointRawRef.current = '';
     setFormData(prev => ({ ...prev, supplyPoint: '', trainIndex: '' }));
+    requestAnimationFrame(() => focusMainFormField('supplyPoint'));
   };
-  const deleteRow = async (id: string) => { await deleteDoc(doc(db, 'fuelRecords', id)); };
+  const deleteRow = async (id: string) => {
+    if (!isAdmin) return;
+    await deleteDoc(doc(db, 'fuelRecords', id));
+  };
   const editRow = (row: FuelRecord) => { setFormData(row); setStaffInputRaw(row.staffName || ''); setSupplyPointRaw(row.supplyPoint || ''); supplyPointRawRef.current = row.supplyPoint || ''; setEditingId(row.id); };
-  const clearForm = () => { setFormData({ supplyPoint: '', route: '', locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '', staffName: '' }); setStaffInputRaw(''); setSupplyPointRaw(''); supplyPointRawRef.current = ''; setEditingId(null); };
+  const clearForm = () => {
+    setFormData({ supplyPoint: '', route: '', locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '', staffName: '' });
+    setStaffInputRaw('');
+    setSupplyPointRaw('');
+    supplyPointRawRef.current = '';
+    setEditingId(null);
+    requestAnimationFrame(() => focusMainFormField('supplyPoint'));
+  };
 
   useEffect(() => {
     setIsTodayClosed(closedDates.includes(activeEntryDate));
@@ -652,6 +803,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
             {isAdmin ? ([
               { icon: '👥', label: 'Xodimlar', action: () => setIsModalOpen(true) },
               { icon: '📅', label: 'Taqvim', action: () => setIsCalendarOpen(true) },
+              { icon: '🔐', label: 'Parol', action: () => setIsAdminPasswordModalOpen(true) },
             ]).map(b => (
               <button
                 key={b.label}
@@ -734,7 +886,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                       <td className="px-2 py-2">{r.supplyPoint}</td>
                       <td className="px-2 py-2">{r.moveType}</td>
                       <td className="px-2 py-2">{r.staffName}</td>
-                      <td className="px-2 py-2 text-right font-mono">{Number(r.fuelAmount || 0).toLocaleString()}</td>
+                      <td className="px-2 py-2 text-right font-mono">{formatAmount(r.fuelAmount)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -753,10 +905,12 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
               <div className="flex flex-col gap-1 col-span-1">
                 <label className={`text-[10px] font-bold uppercase tracking-wider ${t.inputLabel}`}>Zaprafka</label>
                 <input
+                  ref={setMainFormFieldRef('supplyPoint')}
                   list="sklad-list"
                   placeholder="№ yoki nom..."
                   value={supplyPointRaw}
                   onChange={e => handleSupplyPointInput(e.target.value)}
+                  onKeyDown={handleMainFormArrowKey('supplyPoint')}
                   className={`${t.inputBg} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
                 />
                 <datalist id="sklad-list">{skladOptions.map(o => <option key={o.key} value={o.value}>{o.key} - {o.value}</option>)}</datalist>
@@ -766,48 +920,54 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
               <div className="flex flex-col gap-1 col-span-1">
                 <label className={`text-[10px] font-bold uppercase tracking-wider ${t.inputLabel}`}>Poyezd rusumi</label>
                 <input
+                  ref={setMainFormFieldRef('locoSeries')}
                   list="series-list"
                   placeholder="№ yozing..."
                   value={formData.locoSeries || ''}
                   onChange={e => { const v = e.target.value; const f = seriesOptionsState.find(o => o.key === v); setFormData({ ...formData, locoSeries: f ? f.value : v }); }}
+                  onKeyDown={handleMainFormArrowKey('locoSeries')}
                   className={`${t.inputBg} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
                 />
                 <datalist id="series-list">{seriesOptionsState.map(o => <option key={o.key} value={o.value}>{o.key} - {o.value}</option>)}</datalist>
               </div>
 
               {/* 3. Raqami (locoCode) */}
-              <FormInput label="Raqami" type="text" value={formData.locoCode} onChange={v => setFormData({ ...formData, locoCode: v })} theme={t.inputBg} labelClass={t.inputLabel} />
+              <FormInput label="Raqami" type="text" value={formData.locoCode} onChange={v => { setFormData({ ...formData, locoCode: v }); autoAdvanceMainFormField('locoCode', v); }} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('locoCode')} onKeyDown={handleMainFormArrowKey('locoCode')} />
 
               {/* 4. Harakat turi */}
               <div className="flex flex-col gap-1 col-span-1">
                 <label className={`text-[10px] font-bold uppercase tracking-wider ${t.inputLabel}`}>Harakat turi</label>
                 <input
+                  ref={setMainFormFieldRef('moveType')}
                   list="move-list"
                   placeholder="№ yozing..."
                   value={formData.moveType || ''}
                   onChange={e => { const v = e.target.value; const f = moveOptions.find(o => o.key === v); setFormData({ ...formData, moveType: f ? f.value : v }); }}
+                  onKeyDown={handleMainFormArrowKey('moveType')}
                   className={`${t.inputBg} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
                 />
                 <datalist id="move-list">{moveOptions.map(o => <option key={o.key} value={o.value}>{o.key} - {o.value}</option>)}</datalist>
               </div>
 
               {/* 5. Poyezd Raqami (locoNumber) */}
-              <FormInput label="P.Raqami" type="text" value={formData.locoNumber} onChange={v => setFormData({ ...formData, locoNumber: v })} theme={t.inputBg} labelClass={t.inputLabel} />
+              <FormInput label="P.Raqami" type="text" value={formData.locoNumber} onChange={v => { setFormData({ ...formData, locoNumber: v }); autoAdvanceMainFormField('locoNumber', v); }} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('locoNumber')} onKeyDown={handleMainFormArrowKey('locoNumber')} />
 
               {/* 6. Ruxsat indexi */}
-              <FormInput label="Ruxsat indexi" value={formData.trainNumber} onChange={v => setFormData({ ...formData, trainNumber: v })} theme={t.inputBg} labelClass={t.inputLabel} />
+              <FormInput label="Ruxsat indexi" value={formData.trainNumber} onChange={v => setFormData({ ...formData, trainNumber: v })} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('trainNumber')} onKeyDown={handleMainFormArrowKey('trainNumber')} />
 
               {/* 7. Poyezd Vazni */}
-              <FormInput label="Poyezd Vazni" type="number" value={formData.weight} onChange={v => setFormData({ ...formData, weight: v })} theme={t.inputBg} labelClass={t.inputLabel} />
+              <FormInput label="Poyezd Vazni" type="number" value={formData.weight} onChange={v => setFormData({ ...formData, weight: v })} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('weight')} onKeyDown={handleMainFormArrowKey('weight')} />
 
               {/* 8. Xodim */}
               <div className="flex flex-col gap-1 col-span-1">
                 <label className={`text-[10px] font-bold uppercase tracking-wider ${t.inputLabel}`}>Xodim</label>
                 <input
+                  ref={setMainFormFieldRef('staffName')}
                   list="staff-list"
                   placeholder="Tabel № yoki ism..."
                   value={staffInputRaw}
                   onChange={e => handleStaffInput(e.target.value)}
+                  onKeyDown={handleMainFormArrowKey('staffName')}
                   className={`${t.inputBg} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
                 />
                 <datalist id="staff-list">{staffList.map(s => <option key={s.id} value={s.tabelNumber}>{s.tabelNumber} - {s.fullName} ({s.zapravka})</option>)}</datalist>
@@ -817,10 +977,10 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
               </div>
 
               {/* 9. Qoldiq */}
-              <FormInput label="Kelgan qoldiq" type="number" value={formData.balanceBefore} onChange={v => setFormData({ ...formData, balanceBefore: v })} theme={t.inputBg} labelClass={t.inputLabel} />
+              <FormInput label="Kelgan qoldiq" type="number" value={formData.balanceBefore} onChange={v => setFormData({ ...formData, balanceBefore: v })} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('balanceBefore')} onKeyDown={handleMainFormArrowKey('balanceBefore')} />
 
               {/* 10. Yoqilg'i */}
-              <FormInput label="Berilgan yoqilg'i" type="number" value={formData.fuelAmount} onChange={v => setFormData({ ...formData, fuelAmount: v })} theme={t.inputBg} labelClass={t.inputLabel} />
+              <FormInput label="Berilgan yoqilg'i" type="number" value={formData.fuelAmount} onChange={v => setFormData({ ...formData, fuelAmount: v })} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('fuelAmount')} onKeyDown={handleMainFormArrowKey('fuelAmount')} />
             </div>
 
             {/* Action buttons */}
@@ -858,16 +1018,17 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
             </span>
             <div className="flex gap-2">
               <button type="button" onClick={() => {
-                if (isMobileDevice()) openMobileExport('pdf', visibleRows);
-                else handleExportPdf();
+                const reportTitle = formatDateRangeTitle(null, null);
+                if (isMobileDevice()) openMobileExport('pdf', visibleRows, reportTitle);
+                else handleExportPdf(visibleRows, reportTitle);
               }} className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold tracking-wide transition-all active:scale-95 shadow-sm">
                 📄 PDF
               </button>
               <button type="button" onClick={() => {
                 if (isMobileDevice()) openMobileExport('erju', visibleRows);
-                else handleExportErjuPdf();
+                else handleExportErjuPdf(visibleRows, formatErjuDateRangeTitle(null, null));
               }} className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold tracking-wide transition-all active:scale-95 shadow-sm">
-                📊 ERJU PDF
+                📊 Y.PDF
               </button>
             </div>
           </div>
@@ -920,13 +1081,15 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                     <td className={`px-3 py-2.5 text-sm ${t.tableCell}`}>{row.trainNumber}</td>
                     <td className={`px-3 py-2.5 text-sm ${t.tableCell}`}>{row.weight}</td>
                     <td className={`px-3 py-2.5 text-sm ${t.tableCell} max-w-[120px] truncate`}>{row.staffName}</td>
-                    <td className={`px-3 py-2.5 text-sm text-right font-mono font-semibold ${t.tableMono}`}>{Number(row.balanceBefore).toLocaleString()}</td>
-                    <td className={`px-3 py-2.5 text-sm text-right font-mono font-bold ${t.tableFuel}`}>{Number(row.fuelAmount).toLocaleString()}</td>
-                    <td className={`px-3 py-2.5 text-sm text-right font-mono font-bold ${t.tableSum}`}>{(Number(row.balanceBefore) + Number(row.fuelAmount)).toLocaleString()}</td>
+                    <td className={`px-3 py-2.5 text-sm text-right font-mono font-semibold ${t.tableMono}`}>{formatAmount(row.balanceBefore)}</td>
+                    <td className={`px-3 py-2.5 text-sm text-right font-mono font-bold ${t.tableFuel}`}>{formatAmount(row.fuelAmount)}</td>
+                    <td className={`px-3 py-2.5 text-sm text-right font-mono font-bold ${t.tableSum}`}>{formatAmount(roundAmount(parseAmount(row.balanceBefore) + parseAmount(row.fuelAmount)))}</td>
                     <td className="px-2 py-2.5">
                       <div className="flex justify-center gap-1 transition-all">
                         <button onClick={() => editRow(row)} className={`p-1.5 rounded-lg text-xs transition-colors ${isDarkMode ? 'text-blue-400 hover:bg-blue-400/10' : 'text-blue-600 hover:bg-blue-100'}`}>✏️</button>
-                        <button onClick={() => deleteRow(row.id)} className={`p-1.5 rounded-lg text-xs transition-colors ${isDarkMode ? 'text-rose-400 hover:bg-rose-400/10' : 'text-red-600 hover:bg-red-100'}`}>🗑️</button>
+                        {isAdmin && (
+                          <button onClick={() => deleteRow(row.id)} className={`p-1.5 rounded-lg text-xs transition-colors ${isDarkMode ? 'text-rose-400 hover:bg-rose-400/10' : 'text-red-600 hover:bg-red-100'}`}>🗑️</button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -938,11 +1101,11 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
           {/* Footer bar */}
           <div className={`${t.footerBar} px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3`}>
             <div className="flex flex-wrap items-center gap-3 text-sm font-medium">
-              <span className={t.footerText}>Hisob yoqilg&apos;i: <strong>{stats.total.toLocaleString()}</strong></span>
+              <span className={t.footerText}>Hisob yoqilg&apos;i: <strong>{formatAmount(stats.total)}</strong></span>
               <span className={isDarkMode ? 'text-slate-600' : 'text-slate-400'}>|</span>
               <span className={isDarkMode ? 'text-slate-300' : 'text-slate-600'}>Sana: {todayDate}</span>
               <span className={isDarkMode ? 'text-slate-600' : 'text-slate-400'}>|</span>
-              <span className={isDarkMode ? 'text-amber-300' : 'text-amber-700'}>Bugungi jami: <strong>{todayTotal.toLocaleString()}</strong></span>
+              <span className={isDarkMode ? 'text-amber-300' : 'text-amber-700'}>Bugungi jami: <strong>{formatAmount(todayTotal)}</strong></span>
             </div>
             <div className="flex flex-wrap gap-2">
               <button
@@ -1312,7 +1475,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
               </div>
               <div className="p-3 overflow-y-auto" style={{ maxHeight: '60vh' }}>
                 <div ref={mobileExportRef} className="bg-white text-black rounded-xl p-3">
-                  <h4 className="font-bold text-sm mb-2">{mobileExportType === 'pdf' ? 'Hisobot ro‘yxati' : 'ERJU ro‘yxati'}</h4>
+                  <h4 className="font-bold text-sm mb-2">{mobileExportType === 'pdf' ? 'Hisobot ro‘yxati' : 'Y.PDF ro‘yxati'}</h4>
                   <table className="w-full text-xs border-collapse">
                     <thead>
                       <tr>
@@ -1331,8 +1494,8 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                           <td className="border p-1 text-center">{r.time}</td>
                           <td className="border p-1">{r.supplyPoint}</td>
                           <td className="border p-1">{r.moveType}</td>
-                          <td className="border p-1 text-right">{Number(r.fuelAmount || 0).toLocaleString()}</td>
-                          <td className="border p-1 text-right">{(Number(r.balanceBefore || 0) + Number(r.fuelAmount || 0)).toLocaleString()}</td>
+                          <td className="border p-1 text-right">{formatAmount(r.fuelAmount)}</td>
+                          <td className="border p-1 text-right">{formatAmount(roundAmount(parseAmount(r.balanceBefore) + parseAmount(r.fuelAmount)))}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1343,8 +1506,8 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                 <button
                   type="button"
                   onClick={() => {
-                    if (mobileExportType === 'pdf') handleExportPdf(mobileExportRows);
-                    else handleExportErjuPdf(mobileExportRows);
+                    if (mobileExportType === 'pdf') handleExportPdf(mobileExportRows, mobileExportDocumentTitle);
+                    else handleExportErjuPdf(mobileExportRows, mobileExportDocumentTitle || formatErjuDateRangeTitle(null, null));
                   }}
                   className="px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold"
                 >
@@ -1379,7 +1542,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                 <button
                   type="button"
                   onClick={() => {
-                    if (adminPasswordInput === '1985') {
+                    if (adminPasswordInput === adminPassword) {
                       setAdminPasswordInput('');
                       setIsAdminAuthOpen(false);
                       router.push('/admin');
@@ -1391,6 +1554,39 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                 >
                   Kirish
                 </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {isAdmin && isAdminPasswordModalOpen && (
+          <div className="fixed inset-0 z-[10031] flex items-center justify-center p-4">
+            <div className="absolute inset-0 bg-black/60" onClick={closeAdminPasswordModal} />
+            <div className={`relative ${t.modalBg} w-full max-w-md rounded-3xl overflow-hidden`}>
+              <div className={`px-5 py-4 ${t.modalHeader}`}>
+                <h3 className={`text-base font-bold ${t.modalTitle}`}>Admin parolini o‘zgartirish</h3>
+                <p className={`text-xs mt-1 ${t.modalSub}`}>Yangi parol saqlangach, keyingi admin kirishlar shu parol bilan ishlaydi.</p>
+              </div>
+              <div className="p-5 space-y-3">
+                <div>
+                  <label className={`text-[10px] font-bold uppercase tracking-wider ${t.inputLabel}`}>Joriy parol</label>
+                  <input type="password" value={currentAdminPasswordInput} onChange={(e) => setCurrentAdminPasswordInput(e.target.value)} className={`${t.panelInput} w-full rounded-xl px-3 py-2 mt-1 text-sm outline-none`} placeholder="Amaldagi parol" />
+                </div>
+                <div>
+                  <label className={`text-[10px] font-bold uppercase tracking-wider ${t.inputLabel}`}>Yangi parol</label>
+                  <input type="password" value={newAdminPasswordInput} onChange={(e) => setNewAdminPasswordInput(e.target.value)} className={`${t.panelInput} w-full rounded-xl px-3 py-2 mt-1 text-sm outline-none`} placeholder="Yangi parol" />
+                </div>
+                <div>
+                  <label className={`text-[10px] font-bold uppercase tracking-wider ${t.inputLabel}`}>Tasdiqlash</label>
+                  <input type="password" value={confirmAdminPasswordInput} onChange={(e) => setConfirmAdminPasswordInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && saveAdminPassword()} className={`${t.panelInput} w-full rounded-xl px-3 py-2 mt-1 text-sm outline-none`} placeholder="Yangi parolni qayta kiriting" />
+                </div>
+                <div className={`rounded-2xl px-3 py-2 text-xs ${isDarkMode ? 'bg-white/[0.04] text-slate-400 border border-white/[0.08]' : 'bg-slate-50 text-slate-600 border border-slate-200'}`}>
+                  Tavsiya: kamida 4-6 ta belgi qo‘ying va eslab qoladigan, lekin boshqalar bilmaydigan parol tanlang.
+                </div>
+              </div>
+              <div className={`px-5 py-4 flex justify-end gap-2 border-t ${isDarkMode ? 'border-white/[0.08]' : 'border-slate-200'}`}>
+                <button type="button" onClick={closeAdminPasswordModal} className={`px-3 py-2 rounded-xl text-xs font-semibold ${isDarkMode ? 'bg-slate-700 text-slate-200' : 'bg-slate-200 text-slate-700'}`}>Bekor</button>
+                <button type="button" onClick={saveAdminPassword} className="px-4 py-2 rounded-xl text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white">Saqlash</button>
               </div>
             </div>
           </div>
@@ -1461,13 +1657,15 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
           onClose={() => setIsCalendarOpen(false)}
           onExportPdf={(start, end) => {
             const rangeRows = getRowsByRange(start, end);
-            if (isMobileDevice()) openMobileExport('pdf', rangeRows);
-            else handleExportPdf(rangeRows);
+            const reportTitle = formatDateRangeTitle(start, end || start);
+            if (isMobileDevice()) openMobileExport('pdf', rangeRows, reportTitle);
+            else handleExportPdf(rangeRows, reportTitle);
           }}
           onExportErjuPdf={(start, end) => {
             const rangeRows = getRowsByRange(start, end);
-            if (isMobileDevice()) openMobileExport('erju', rangeRows);
-            else handleExportErjuPdf(rangeRows);
+            const reportTitle = formatErjuDateRangeTitle(start, end || start);
+            if (isMobileDevice()) openMobileExport('erju', rangeRows, reportTitle);
+            else handleExportErjuPdf(rangeRows, reportTitle);
           }}
         />
       </main>
@@ -1484,14 +1682,18 @@ interface FormInputProps {
   theme: string;
   labelClass: string;
   placeholder?: string;
+  inputRef?: (node: HTMLInputElement | null) => void;
+  onKeyDown?: React.KeyboardEventHandler<HTMLInputElement>;
 }
-const FormInput = ({ label, type = 'text', value, onChange, theme, labelClass, placeholder }: FormInputProps) => (
+const FormInput = ({ label, type = 'text', value, onChange, theme, labelClass, placeholder, inputRef, onKeyDown }: FormInputProps) => (
   <div className="flex flex-col gap-1">
     <label className={`text-[10px] font-bold uppercase tracking-wider ${labelClass}`}>{label}</label>
     <input
+      ref={inputRef}
       type={type}
       value={value || ''}
       onChange={e => onChange(e.target.value)}
+      onKeyDown={onKeyDown}
       placeholder={placeholder || `${label}...`}
       className={`${theme} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
     />
