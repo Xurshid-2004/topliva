@@ -24,11 +24,16 @@ interface FuelRecord {
   id: string; date: string; locCode: string; supplyPoint: string; time: string;
   route: string; locoCode: string; locoSeries: string; locoNumber: string;
   trainCode: string; trainNumber: string; moveType: string; trainIndex: string;
-  weight: string; balanceBefore: string; fuelAmount: string; staffName: string;
+  weight: string; balanceBefore: string; fuelAmount: string; maslaAmount: string; staffName: string;
 }
 
 interface Staff {
   id: string; erju: string; zapravka: string; tabelNumber: string; fullName: string;
+}
+interface IndexedOption {
+  id: string;
+  key: string;
+  value: string;
 }
 interface ClosedDayMeta {
   date: string;
@@ -83,6 +88,12 @@ const skladOptions = [
 ];
 
 const roundAmount = (n: number) => Math.round((n + Number.EPSILON) * 1000) / 1000;
+const sanitizeDecimalInput = (raw: string) => {
+  const compact = String(raw ?? '').replace(/\s+/g, '').replace(/,/g, '.').replace(/[^0-9.]/g, '');
+  const [whole = '', ...fractionParts] = compact.split('.');
+  if (fractionParts.length === 0) return whole;
+  return `${whole}.${fractionParts.join('')}`;
+};
 const parseAmount = (value: string | number | undefined | null) => {
   if (typeof value === 'number') return Number.isFinite(value) ? roundAmount(value) : 0;
   const normalized = String(value ?? '').trim().replace(/\s+/g, '').replace(',', '.');
@@ -113,13 +124,27 @@ const MAIN_FORM_FIELD_ORDER: MainFormFieldKey[] = [
   'balanceBefore',
   'fuelAmount',
 ];
+const sortByIndexedKey = <T extends { key: string }>(items: T[]) => [...items].sort((a, b) => {
+  const aNum = Number(a.key);
+  const bNum = Number(b.key);
+  if (Number.isFinite(aNum) && Number.isFinite(bNum) && aNum !== bNum) return aNum - bNum;
+  return a.key.localeCompare(b.key, undefined, { numeric: true, sensitivity: 'base' });
+});
+const sortStaffByTabel = <T extends { tabelNumber: string }>(items: T[]) => [...items].sort((a, b) => a.tabelNumber.localeCompare(b.tabelNumber, undefined, { numeric: true, sensitivity: 'base' }));
+const normalizeStaffValue = (raw: string, staff: Staff[]) => {
+  const trimmed = raw.trim();
+  const byTabel = staff.find((item) => item.tabelNumber === trimmed);
+  if (byTabel) return byTabel.fullName;
+  const byName = staff.find((item) => item.fullName === trimmed);
+  return byName ? byName.fullName : raw;
+};
 
 const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
   const router = useRouter();
   const [rows, setRows] = useState<FuelRecord[]>([]);
   const [staffList, setStaffList] = useState<Staff[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
-  const [formData, setFormData] = useState<Partial<FuelRecord>>({ supplyPoint: '', route: '', locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '', staffName: '' });
+  const [formData, setFormData] = useState<Partial<FuelRecord>>({ supplyPoint: '', route: '', locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '', maslaAmount: '', staffName: '' });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [staffInputRaw, setStaffInputRaw] = useState('');
@@ -128,7 +153,10 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
   const [supplyPointRaw, setSupplyPointRaw] = useState('');
   const supplyPointTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const supplyPointRawRef = useRef('');
-  const [moveOptions, setMoveOptions] = useState(initialMoveOptions);
+  const [locoSeriesRaw, setLocoSeriesRaw] = useState('');
+  const locoSeriesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const locoSeriesRawRef = useRef('');
+  const [moveOptions, setMoveOptions] = useState<IndexedOption[]>(initialMoveOptions.map((item) => ({ id: item.key, ...item })));
   const [isMoveModalOpen, setIsMoveModalOpen] = useState(false);
   const [isMoveAddOpen, setIsMoveAddOpen] = useState(false);
   const [newMoveKey, setNewMoveKey] = useState('');
@@ -136,7 +164,10 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
   const [editingMoveKey, setEditingMoveKey] = useState<string | null>(null);
   const [editMoveKey, setEditMoveKey] = useState('');
   const [editMoveValue, setEditMoveValue] = useState('');
-  const [seriesOptionsState, setSeriesOptionsState] = useState(seriesOptions);
+  const [seriesOptionsState, setSeriesOptionsState] = useState<IndexedOption[]>(seriesOptions.map((item) => ({ id: item.key, ...item })));
+  const [moveTypeRaw, setMoveTypeRaw] = useState('');
+  const moveTypeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const moveTypeRawRef = useRef('');
   const [isCalendarOpen, setIsCalendarOpen] = useState(false);
   const [isSeriesModalOpen, setIsSeriesModalOpen] = useState(false);
   const [isSeriesAddOpen, setIsSeriesAddOpen] = useState(false);
@@ -178,7 +209,9 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
   const [editingChatId, setEditingChatId] = useState<string | null>(null);
   const [editingChatText, setEditingChatText] = useState('');
   const [chatButtonPos, setChatButtonPos] = useState({ x: 0, y: 0 });
+  const [chatToast, setChatToast] = useState('');
   const chatDragRef = useRef({ dragging: false, moved: false, offsetX: 0, offsetY: 0 });
+  const lastSeenChatCreatedAtRef = useRef<number | null>(null);
   const mainFormFieldRefs = useRef<Partial<Record<MainFormFieldKey, HTMLInputElement | null>>>({});
 
   useEffect(() => {
@@ -194,17 +227,21 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
       setIsLoaded(true);
     });
     const unsubStaff = onSnapshot(query(collection(db, 'staff')), (snap) => {
-      const data = snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Staff, 'id'>) }));
+      const data = sortStaffByTabel(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Staff, 'id'>) })));
       setStaffList(data);
     });
     const unsubMoves = onSnapshot(query(collection(db, 'moveOptions')), (snap) => {
       if (snap.empty) return;
-      const data = snap.docs.map((d) => ({ key: String(d.data().key ?? ''), value: String(d.data().value ?? '') })).filter(x => x.key && x.value);
+      const data = sortByIndexedKey(
+        snap.docs.map((d) => ({ id: d.id, key: String(d.data().key ?? ''), value: String(d.data().value ?? '') })).filter(x => x.key && x.value)
+      );
       setMoveOptions(data);
     });
     const unsubSeries = onSnapshot(query(collection(db, 'seriesOptions')), (snap) => {
       if (snap.empty) return;
-      const data = snap.docs.map((d) => ({ key: String(d.data().key ?? ''), value: String(d.data().value ?? '') })).filter(x => x.key && x.value);
+      const data = sortByIndexedKey(
+        snap.docs.map((d) => ({ id: d.id, key: String(d.data().key ?? ''), value: String(d.data().value ?? '') })).filter(x => x.key && x.value)
+      );
       setSeriesOptionsState(data);
     });
     const unsubClosed = onSnapshot(query(collection(db, 'closedDays')), (snap) => {
@@ -254,9 +291,26 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
         };
       });
       setChatMessages(data);
+      const latest = data[data.length - 1];
+      if (!latest) return;
+      if (lastSeenChatCreatedAtRef.current === null) {
+        lastSeenChatCreatedAtRef.current = latest.createdAt;
+        return;
+      }
+      if (latest.createdAt > lastSeenChatCreatedAtRef.current) {
+        lastSeenChatCreatedAtRef.current = latest.createdAt;
+        if (latest.role !== (isAdmin ? 'admin' : 'user') && !isChatOpen) {
+          setChatToast('Sizda yangi xabar bor');
+        }
+      }
     });
     return () => unsubChat();
-  }, []);
+  }, [isAdmin, isChatOpen]);
+  useEffect(() => {
+    if (!chatToast) return;
+    const timer = setTimeout(() => setChatToast(''), 4000);
+    return () => clearTimeout(timer);
+  }, [chatToast]);
 
   const closeModal = () => { setIsModalOpen(false); setSelectedErju(''); setSelectedZapravka(''); setNewStaffName(''); setNewStaffTabel(''); setEditingStaffId(null); };
   const sendChatMessage = async () => {
@@ -340,30 +394,30 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     const key = newMoveKey.trim(); const value = newMoveValue.trim();
     if (!key || !value) return;
     if (moveOptions.some(o => o.key === key)) { alert('Bu tartib raqam allaqachon mavjud!'); return; }
-    await setDoc(doc(db, 'moveOptions', key), { key, value });
+    await addDoc(collection(db, 'moveOptions'), { key, value, createdAt: Date.now() });
     setNewMoveKey(''); setNewMoveValue(''); setIsMoveAddOpen(false);
   };
   const saveMoveEdit = async () => {
     if (!editMoveKey.trim() || !editMoveValue.trim()) return;
-    if (editMoveKey.trim() !== editingMoveKey && moveOptions.some(o => o.key === editMoveKey.trim())) { alert('Bu tartib raqam allaqachon mavjud!'); return; }
-    if (!editingMoveKey) return;
-    await deleteDoc(doc(db, 'moveOptions', editingMoveKey));
-    await setDoc(doc(db, 'moveOptions', editMoveKey.trim()), { key: editMoveKey.trim(), value: editMoveValue.trim() });
+    const currentItem = moveOptions.find((o) => o.id === editingMoveKey);
+    if (!currentItem) return;
+    if (editMoveKey.trim() !== currentItem.key && moveOptions.some(o => o.key === editMoveKey.trim())) { alert('Bu tartib raqam allaqachon mavjud!'); return; }
+    await updateDoc(doc(db, 'moveOptions', currentItem.id), { key: editMoveKey.trim(), value: editMoveValue.trim(), updatedAt: Date.now() });
     setEditingMoveKey(null);
   };
   const addSeriesOption = async () => {
     const key = newSeriesKey.trim(); const value = newSeriesValue.trim();
     if (!key || !value) return;
     if (seriesOptionsState.some(o => o.key === key)) { alert('Bu tartib raqam allaqachon mavjud!'); return; }
-    await setDoc(doc(db, 'seriesOptions', key), { key, value });
+    await addDoc(collection(db, 'seriesOptions'), { key, value, createdAt: Date.now() });
     setNewSeriesKey(''); setNewSeriesValue(''); setIsSeriesAddOpen(false);
   };
   const saveSeriesEdit = async () => {
     if (!editSeriesKey.trim() || !editSeriesValue.trim()) return;
-    if (editSeriesKey.trim() !== editingSeriesKey && seriesOptionsState.some(o => o.key === editSeriesKey.trim())) { alert('Bu tartib raqam allaqachon mavjud!'); return; }
-    if (!editingSeriesKey) return;
-    await deleteDoc(doc(db, 'seriesOptions', editingSeriesKey));
-    await setDoc(doc(db, 'seriesOptions', editSeriesKey.trim()), { key: editSeriesKey.trim(), value: editSeriesValue.trim() });
+    const currentItem = seriesOptionsState.find((o) => o.id === editingSeriesKey);
+    if (!currentItem) return;
+    if (editSeriesKey.trim() !== currentItem.key && seriesOptionsState.some(o => o.key === editSeriesKey.trim())) { alert('Bu tartib raqam allaqachon mavjud!'); return; }
+    await updateDoc(doc(db, 'seriesOptions', currentItem.id), { key: editSeriesKey.trim(), value: editSeriesValue.trim(), updatedAt: Date.now() });
     setEditingSeriesKey(null);
   };
   const handleStaffInput = (raw: string) => {
@@ -376,7 +430,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     const v = raw.trim();
     const byTabel = staffList.find(s => s.tabelNumber === v);
     const hasLongerPrefix = staffList.some(s => s.tabelNumber.startsWith(v) && s.tabelNumber.length > v.length);
-    if (byTabel && (!hasLongerPrefix || v.length >= 3)) {
+    if (byTabel && !hasLongerPrefix) {
       setFormData(prev => ({ ...prev, staffName: byTabel.fullName }));
       setStaffInputRaw(byTabel.fullName);
       staffInputRawRef.current = byTabel.fullName;
@@ -384,7 +438,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     }
     const byName = staffList.find(s => s.fullName === raw.trim());
     setFormData(prev => ({ ...prev, staffName: byName ? byName.fullName : raw }));
-    if (byTabel && hasLongerPrefix && v.length < 3) {
+    if (byTabel && hasLongerPrefix) {
       const currentRaw = raw;
       staffInputTimerRef.current = setTimeout(() => {
         if (staffInputRawRef.current === currentRaw) {
@@ -412,6 +466,96 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     }
   };
   const selectSklad = (keyOrValue: string) => { handleSupplyPointInput(keyOrValue, true); setIsSkladOpen(false); };
+  const normalizeIndexedOptionValue = (raw: string, options: IndexedOption[]) => {
+    const trimmed = raw.trim();
+    const byKey = options.find((option) => option.key === trimmed);
+    if (byKey) return byKey.value;
+    const byValue = options.find((option) => option.value === trimmed);
+    return byValue ? byValue.value : raw;
+  };
+  const handleIndexedOptionInput = (
+    raw: string,
+    field: 'locoSeries' | 'moveType',
+    options: IndexedOption[],
+    setRaw: React.Dispatch<React.SetStateAction<string>>,
+    rawRef: React.MutableRefObject<string>,
+    timerRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>,
+    resolveWhileTyping = true
+  ) => {
+    setRaw(raw);
+    rawRef.current = raw;
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      setFormData((prev) => ({ ...prev, [field]: '' }));
+      return;
+    }
+    if (!resolveWhileTyping) {
+      setFormData((prev) => ({ ...prev, [field]: raw }));
+      const currentRaw = raw;
+      timerRef.current = setTimeout(() => {
+        if (rawRef.current !== currentRaw) return;
+        const normalized = normalizeIndexedOptionValue(currentRaw, options);
+        if (normalized === currentRaw) return;
+        setFormData((prev) => ({ ...prev, [field]: normalized }));
+        setRaw(normalized);
+        rawRef.current = normalized;
+      }, 1000);
+      return;
+    }
+    const byKey = options.find((option) => option.key === trimmed);
+    const hasLongerPrefix = options.some((option) => option.key.startsWith(trimmed) && option.key.length > trimmed.length);
+    const shouldResolve = !!byKey && (!hasLongerPrefix || trimmed.length >= 2);
+    if (shouldResolve && byKey) {
+      setFormData((prev) => ({ ...prev, [field]: byKey.value }));
+      setRaw(byKey.value);
+      rawRef.current = byKey.value;
+      return;
+    }
+    setFormData((prev) => ({ ...prev, [field]: raw }));
+    if (byKey && hasLongerPrefix && trimmed.length === 1) {
+      const currentRaw = raw;
+      timerRef.current = setTimeout(() => {
+        if (rawRef.current === currentRaw) {
+          setFormData((prev) => ({ ...prev, [field]: byKey.value }));
+          setRaw(byKey.value);
+          rawRef.current = byKey.value;
+        }
+      }, 700);
+    }
+  };
+  const handleDecimalInput = (field: 'balanceBefore' | 'fuelAmount' | 'maslaAmount', raw: string) => {
+    setFormData((prev) => ({ ...prev, [field]: sanitizeDecimalInput(raw) }));
+  };
+  const finalizeStaffInput = () => {
+    if (staffInputTimerRef.current) {
+      clearTimeout(staffInputTimerRef.current);
+      staffInputTimerRef.current = null;
+    }
+    const normalized = normalizeStaffValue(staffInputRawRef.current, staffList);
+    setFormData(prev => ({ ...prev, staffName: normalized }));
+    setStaffInputRaw(normalized);
+    staffInputRawRef.current = normalized;
+  };
+  const finalizeIndexedOptionInput = (
+    field: 'locoSeries' | 'moveType',
+    options: IndexedOption[],
+    rawRef: React.MutableRefObject<string>,
+    setRaw: React.Dispatch<React.SetStateAction<string>>,
+    timerRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>
+  ) => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    const normalized = normalizeIndexedOptionValue(rawRef.current, options);
+    setFormData((prev) => ({ ...prev, [field]: normalized }));
+    setRaw(normalized);
+    rawRef.current = normalized;
+  };
   const visibleRows = useMemo(
     () => rows.filter(r => r.date === activeEntryDate && !closedDates.includes(r.date)),
     [rows, closedDates, activeEntryDate]
@@ -492,9 +636,11 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
       const [zap, staff] = key.split('|||');
       const rowsHtml = group.map((r) => `<tr class="data-row"><td>${r.time||''}</td><td>${r.locoSeries||''}</td><td>${r.locoCode||''}</td><td>${r.moveType||''}</td><td>${r.locoNumber||''}</td><td>${r.trainNumber||''}</td><td class="num">${r.weight||''}</td><td class="num">${formatAmount(r.balanceBefore)}</td><td class="num">${formatAmount(r.fuelAmount)}</td><td class="num">${formatAmount(roundAmount(parseAmount(r.balanceBefore) + parseAmount(r.fuelAmount)))}</td></tr>`).join('');
       const cleanZap = (zap||'').replace(/\s*zapravka\s*/i,'').trim();
-      return `<tr class="group-row"><td colspan="10">${cleanZap||'-'} - ${staff||'-'}</td></tr>${rowsHtml}`;
+      const maslaValues = [...new Set(group.map((r) => sanitizeDecimalInput(String(r.maslaAmount || ''))).filter(Boolean))];
+      const maslaDisplay = maslaValues.length ? maslaValues.map((value) => formatAmount(value)).join(', ') : '-';
+      return `<tr class="group-row"><td colspan="10">${cleanZap||'-'} - ${staff||'-'}</td></tr><tr class="meta-row"><td colspan="10">B.macla: ${maslaDisplay}</td></tr>${rowsHtml}`;
     }).join('');
-    printWindow.document.write(`<html><head><title>PDF</title><meta charset="utf-8"/><style>@page{size:A4 portrait;margin:8mm 9mm;}*{box-sizing:border-box;}body{font-family:Arial,sans-serif;color:#111;margin:0;padding:0;}.sheet{width:95%;margin:0 auto;}table{width:100%;border-collapse:collapse;table-layout:fixed;border:1px solid #555;font-size:9.4px;}thead{display:table-header-group;}th{border:1px solid #666;padding:3px 2px;text-align:center;vertical-align:middle;font-weight:700;line-height:1.1;background:#f5f5f5;}td{padding:1px 3px;text-align:center;vertical-align:middle;line-height:1.15;}tbody td{border:none;}tbody tr{page-break-inside:avoid;}.title-row th{font-size:10.5px;font-weight:700;padding:5px 4px;background:#fff;}.group-head th{font-size:9.5px;}.sub-head th{font-size:8.8px;}.num-head th{font-size:8.5px;padding:2px 0;background:#fff;}.group-row td{padding:6px 3px 3px 10px;text-align:left;font-size:10.3px;font-weight:700;}.group-row:not(:first-child) td{padding-top:9px;}.data-row td:first-child{text-align:left;}.num{text-align:right;}.cargo-box{width:95%;margin:8px auto 8px;display:flex;justify-content:flex-start;gap:10px;align-items:flex-start;flex-wrap:wrap;}.cargo-item{min-width:110px;padding:4px 8px;border:1px solid #666;background:#fafafa;font-size:9px;}.cargo-item strong{display:block;font-size:10px;margin-bottom:2px;}.cargo-note{font-size:8.6px;font-weight:700;align-self:center;}.summary-box{width:95%;margin:10px auto 0;display:flex;justify-content:flex-end;}.summary-table{width:220px;border-collapse:collapse;font-size:9.4px;}.summary-table td{border:1px solid #666;padding:4px 6px;}.summary-table td:last-child{text-align:right;font-weight:700;}col.c1{width:7%;}col.c2{width:9%;}col.c3{width:9%;}col.c4{width:11%;}col.c5{width:10%;}col.c6{width:11%;}col.c7{width:10%;}col.c8{width:11%;}col.c9{width:8%;}col.c10{width:9%;}</style></head><body><div class="sheet"><table><colgroup><col class="c1"/><col class="c2"/><col class="c3"/><col class="c4"/><col class="c5"/><col class="c6"/><col class="c7"/><col class="c8"/><col class="c9"/><col class="c10"/></colgroup><thead><tr class="title-row"><th colspan="10">${reportTitle}</th></tr><tr class="group-head"><th rowspan="2">Vaqt</th><th colspan="2">Teplovozlar bo'yicha ma'lumot</th><th colspan="4">Poyezdlar va tashkilotlar bo'yicha ma'lumot</th><th rowspan="2">Qoldiq</th><th rowspan="2">B.yoqilg'i</th><th rowspan="2">Hisob</th></tr><tr class="sub-head"><th>Poyezd rusumi</th><th>Raqami</th><th>Harakat turi</th><th>P.Raqami</th><th>Ruxsat indexi</th><th>Poyezd vazni</th></tr><tr class="num-head"><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th></tr></thead><tbody>${bodyRows || "<tr class=\"group-row\"><td colspan=\"10\">Ma'lumot yo'q</td></tr>"}</tbody></table></div><div class="cargo-box"><div class="cargo-item"><strong>Umumiy yuk</strong>${formatAmount(totalCargoWeight)}</div><div class="cargo-item"><strong>Ortildi</strong>${formatAmount(loadedWeight)}</div><div class="cargo-item"><strong>Tranzit</strong>${formatAmount(transitWeight)}</div><div class="cargo-note">Tranzit = Umumiy yuk - Ortildi. Faqat yuk harakati hisobga olinadi.</div></div><div class="summary-box"><table class="summary-table"><tbody><tr><td>Jami qoldiq</td><td>${formatAmount(totalBalance)}</td></tr><tr><td>Jami B.yoqilg'i</td><td>${formatAmount(totalFuel)}</td></tr><tr><td>Jami hisob</td><td>${formatAmount(totalAmount)}</td></tr></tbody></table></div></body></html>`);
+    printWindow.document.write(`<html><head><title>PDF</title><meta charset="utf-8"/><style>@page{size:A4 portrait;margin:8mm 9mm;}*{box-sizing:border-box;}body{font-family:Arial,sans-serif;color:#111;margin:0;padding:0;}.sheet{width:95%;margin:0 auto;}table{width:100%;border-collapse:collapse;table-layout:fixed;border:1px solid #555;font-size:9.4px;}thead{display:table-header-group;}th{border:1px solid #666;padding:3px 2px;text-align:center;vertical-align:middle;font-weight:700;line-height:1.1;background:#f5f5f5;}td{padding:1px 3px;text-align:center;vertical-align:middle;line-height:1.15;}tbody td{border:none;}tbody tr{page-break-inside:avoid;}.title-row th{font-size:10.5px;font-weight:700;padding:5px 4px;background:#fff;}.group-head th{font-size:9.5px;}.sub-head th{font-size:8.8px;}.num-head th{font-size:8.5px;padding:2px 0;background:#fff;}.group-row td{padding:6px 3px 3px 10px;text-align:left;font-size:10.3px;font-weight:700;}.group-row:not(:first-child) td{padding-top:9px;}.meta-row td{padding:1px 3px 5px 10px;text-align:left;font-size:9px;font-weight:700;color:#333;}.data-row td:first-child{text-align:left;}.num{text-align:right;}.cargo-box{width:95%;margin:8px auto 8px;display:flex;justify-content:flex-start;gap:10px;align-items:flex-start;flex-wrap:wrap;}.cargo-item{min-width:110px;padding:4px 8px;border:1px solid #666;background:#fafafa;font-size:9px;}.cargo-item strong{display:block;font-size:10px;margin-bottom:2px;}.cargo-note{font-size:8.6px;font-weight:700;align-self:center;}.summary-box{width:95%;margin:10px auto 0;display:flex;justify-content:flex-end;}.summary-table{width:220px;border-collapse:collapse;font-size:9.4px;}.summary-table td{border:1px solid #666;padding:4px 6px;}.summary-table td:last-child{text-align:right;font-weight:700;}col.c1{width:7%;}col.c2{width:9%;}col.c3{width:9%;}col.c4{width:11%;}col.c5{width:10%;}col.c6{width:11%;}col.c7{width:10%;}col.c8{width:11%;}col.c9{width:8%;}col.c10{width:9%;}</style></head><body><div class="sheet"><table><colgroup><col class="c1"/><col class="c2"/><col class="c3"/><col class="c4"/><col class="c5"/><col class="c6"/><col class="c7"/><col class="c8"/><col class="c9"/><col class="c10"/></colgroup><thead><tr class="title-row"><th colspan="10">${reportTitle}</th></tr><tr class="group-head"><th rowspan="2">Vaqt</th><th colspan="2">Teplovozlar bo'yicha ma'lumot</th><th colspan="4">Poyezdlar va tashkilotlar bo'yicha ma'lumot</th><th rowspan="2">Qoldiq</th><th rowspan="2">B.yoqilg'i</th><th rowspan="2">Hisob</th></tr><tr class="sub-head"><th>Poyezd rusumi</th><th>Raqami</th><th>Harakat turi</th><th>P.Raqami</th><th>Ruxsat indexi</th><th>Poyezd vazni</th></tr><tr class="num-head"><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>9</th><th>10</th></tr></thead><tbody>${bodyRows || "<tr class=\"group-row\"><td colspan=\"10\">Ma'lumot yo'q</td></tr>"}</tbody></table></div><div class="cargo-box"><div class="cargo-item"><strong>Umumiy yuk</strong>${formatAmount(totalCargoWeight)}</div><div class="cargo-item"><strong>Ortildi</strong>${formatAmount(loadedWeight)}</div><div class="cargo-item"><strong>Tranzit</strong>${formatAmount(transitWeight)}</div><div class="cargo-note">Tranzit = Umumiy yuk - Ortildi. Faqat yuk harakati hisobga olinadi.</div></div><div class="summary-box"><table class="summary-table"><tbody><tr><td>Jami qoldiq</td><td>${formatAmount(totalBalance)}</td></tr><tr><td>Jami B.yoqilg'i</td><td>${formatAmount(totalFuel)}</td></tr></tbody></table></div></body></html>`);
     printWindow.document.close();
     printWindow.focus();
     setTimeout(() => printWindow.print(), 350);
@@ -646,21 +792,34 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
 
   const addRow = async (e: React.FormEvent) => {
     e.preventDefault();
+    const normalizedFormData = {
+      ...(formData as FuelRecord),
+      locoSeries: normalizeIndexedOptionValue(locoSeriesRaw || String(formData.locoSeries || ''), seriesOptionsState),
+      moveType: normalizeIndexedOptionValue(moveTypeRaw || String(formData.moveType || ''), moveOptions),
+      staffName: normalizeStaffValue(staffInputRaw || String(formData.staffName || ''), staffList),
+      balanceBefore: sanitizeDecimalInput(String(formData.balanceBefore || '')),
+      fuelAmount: sanitizeDecimalInput(String(formData.fuelAmount || '')),
+      maslaAmount: sanitizeDecimalInput(String(formData.maslaAmount || '')),
+    };
     if (editingId) {
-      await updateDoc(doc(db, 'fuelRecords', editingId), { ...(formData as FuelRecord) });
+      await updateDoc(doc(db, 'fuelRecords', editingId), normalizedFormData);
       setEditingId(null);
     } else {
       const now = new Date();
       await addDoc(collection(db, 'fuelRecords'), {
-        ...(formData as FuelRecord),
+        ...normalizedFormData,
         date: activeEntryDate,
         time: now.toLocaleTimeString('uz-UZ', { hour: '2-digit', minute: '2-digit' }),
         createdAt: now.getTime()
       });
     }
-    setFormData(prev => ({ ...prev, locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '' }));
+    setFormData(prev => ({ ...prev, locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '', maslaAmount: '' }));
     setStaffInputRaw('');
     setSupplyPointRaw('');
+    setLocoSeriesRaw('');
+    locoSeriesRawRef.current = '';
+    setMoveTypeRaw('');
+    moveTypeRawRef.current = '';
     supplyPointRawRef.current = '';
     setFormData(prev => ({ ...prev, supplyPoint: '', trainIndex: '' }));
     requestAnimationFrame(() => focusMainFormField('supplyPoint'));
@@ -669,11 +828,25 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
     if (!isAdmin) return;
     await deleteDoc(doc(db, 'fuelRecords', id));
   };
-  const editRow = (row: FuelRecord) => { setFormData(row); setStaffInputRaw(row.staffName || ''); setSupplyPointRaw(row.supplyPoint || ''); supplyPointRawRef.current = row.supplyPoint || ''; setEditingId(row.id); };
+  const editRow = (row: FuelRecord) => {
+    setFormData(row);
+    setStaffInputRaw(row.staffName || '');
+    setSupplyPointRaw(row.supplyPoint || '');
+    supplyPointRawRef.current = row.supplyPoint || '';
+    setLocoSeriesRaw(row.locoSeries || '');
+    locoSeriesRawRef.current = row.locoSeries || '';
+    setMoveTypeRaw(row.moveType || '');
+    moveTypeRawRef.current = row.moveType || '';
+    setEditingId(row.id);
+  };
   const clearForm = () => {
-    setFormData({ supplyPoint: '', route: '', locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '', staffName: '' });
+    setFormData({ supplyPoint: '', route: '', locoCode: '', locoSeries: '', locoNumber: '', trainNumber: '', moveType: '', weight: '', balanceBefore: '', fuelAmount: '', maslaAmount: '', staffName: '' });
     setStaffInputRaw('');
     setSupplyPointRaw('');
+    setLocoSeriesRaw('');
+    locoSeriesRawRef.current = '';
+    setMoveTypeRaw('');
+    moveTypeRawRef.current = '';
     supplyPointRawRef.current = '';
     setEditingId(null);
     requestAnimationFrame(() => focusMainFormField('supplyPoint'));
@@ -696,7 +869,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
 
   if (!isMounted || !isLoaded) return null;
 
-  const erjuAllStaff = staffList.filter(s => s.erju === selectedErju);
+  const erjuAllStaff = sortStaffByTabel(staffList.filter(s => s.erju === selectedErju));
   const selectedErjuData = ERJU_DATA.find(e => e.name === selectedErju);
   const todayDate = formatDate(parseIsoDate(activeEntryDate));
 
@@ -923,12 +1096,13 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                   ref={setMainFormFieldRef('locoSeries')}
                   list="series-list"
                   placeholder="№ yozing..."
-                  value={formData.locoSeries || ''}
-                  onChange={e => { const v = e.target.value; const f = seriesOptionsState.find(o => o.key === v); setFormData({ ...formData, locoSeries: f ? f.value : v }); }}
+                  value={locoSeriesRaw}
+                  onChange={e => handleIndexedOptionInput(e.target.value, 'locoSeries', seriesOptionsState, setLocoSeriesRaw, locoSeriesRawRef, locoSeriesTimerRef, false)}
+                  onBlur={() => finalizeIndexedOptionInput('locoSeries', seriesOptionsState, locoSeriesRawRef, setLocoSeriesRaw, locoSeriesTimerRef)}
                   onKeyDown={handleMainFormArrowKey('locoSeries')}
                   className={`${t.inputBg} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
                 />
-                <datalist id="series-list">{seriesOptionsState.map(o => <option key={o.key} value={o.value}>{o.key} - {o.value}</option>)}</datalist>
+                <datalist id="series-list">{seriesOptionsState.map(o => <option key={o.id} value={o.key}>{o.key} - {o.value}</option>)}</datalist>
               </div>
 
               {/* 3. Raqami (locoCode) */}
@@ -941,12 +1115,13 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                   ref={setMainFormFieldRef('moveType')}
                   list="move-list"
                   placeholder="№ yozing..."
-                  value={formData.moveType || ''}
-                  onChange={e => { const v = e.target.value; const f = moveOptions.find(o => o.key === v); setFormData({ ...formData, moveType: f ? f.value : v }); }}
+                  value={moveTypeRaw}
+                  onChange={e => handleIndexedOptionInput(e.target.value, 'moveType', moveOptions, setMoveTypeRaw, moveTypeRawRef, moveTypeTimerRef)}
+                  onBlur={() => finalizeIndexedOptionInput('moveType', moveOptions, moveTypeRawRef, setMoveTypeRaw, moveTypeTimerRef)}
                   onKeyDown={handleMainFormArrowKey('moveType')}
                   className={`${t.inputBg} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
                 />
-                <datalist id="move-list">{moveOptions.map(o => <option key={o.key} value={o.value}>{o.key} - {o.value}</option>)}</datalist>
+                <datalist id="move-list">{moveOptions.map(o => <option key={o.id} value={o.key}>{o.key} - {o.value}</option>)}</datalist>
               </div>
 
               {/* 5. Poyezd Raqami (locoNumber) */}
@@ -967,6 +1142,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                   placeholder="Tabel № yoki ism..."
                   value={staffInputRaw}
                   onChange={e => handleStaffInput(e.target.value)}
+                  onBlur={finalizeStaffInput}
                   onKeyDown={handleMainFormArrowKey('staffName')}
                   className={`${t.inputBg} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
                 />
@@ -977,22 +1153,35 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
               </div>
 
               {/* 9. Qoldiq */}
-              <FormInput label="Kelgan qoldiq" type="number" value={formData.balanceBefore} onChange={v => setFormData({ ...formData, balanceBefore: v })} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('balanceBefore')} onKeyDown={handleMainFormArrowKey('balanceBefore')} />
+              <FormInput label="Kelgan qoldiq" type="text" inputMode="decimal" value={formData.balanceBefore} onChange={v => handleDecimalInput('balanceBefore', v)} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('balanceBefore')} onKeyDown={handleMainFormArrowKey('balanceBefore')} />
 
               {/* 10. Yoqilg'i */}
-              <FormInput label="Berilgan yoqilg'i" type="number" value={formData.fuelAmount} onChange={v => setFormData({ ...formData, fuelAmount: v })} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('fuelAmount')} onKeyDown={handleMainFormArrowKey('fuelAmount')} />
+              <FormInput label="Berilgan yoqilg'i" type="text" inputMode="decimal" value={formData.fuelAmount} onChange={v => handleDecimalInput('fuelAmount', v)} theme={t.inputBg} labelClass={t.inputLabel} inputRef={setMainFormFieldRef('fuelAmount')} onKeyDown={handleMainFormArrowKey('fuelAmount')} />
             </div>
 
             {/* Action buttons */}
             <div className={`flex flex-wrap items-center justify-between gap-2 pt-4 mt-3 border-t ${isDarkMode ? 'border-white/[0.07]' : 'border-slate-200'}`}>
-              <button
-                type="button"
-                onClick={clearForm}
-                className={`px-5 py-2 rounded-lg font-semibold text-sm flex items-center gap-1.5 transition-all active:scale-95 
-                  ${isDarkMode ? 'bg-white/[0.06] border border-white/[0.1] text-slate-300 hover:bg-white/[0.1]' : 'bg-slate-100 border border-slate-300 text-slate-700 hover:bg-slate-200'}`}
-              >
-                <span>↻</span> Tozalash
-              </button>
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="flex flex-col gap-1 min-w-[220px]">
+                  <label className={`text-[10px] font-bold uppercase tracking-wider ${t.inputLabel}`}>Berilgan masla</label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={formData.maslaAmount || ''}
+                    onChange={e => handleDecimalInput('maslaAmount', e.target.value)}
+                    placeholder="Berilgan masla..."
+                    className={`${t.inputBg} rounded-lg px-2.5 py-2 text-sm outline-none transition-all w-full`}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={clearForm}
+                  className={`px-5 py-2 rounded-lg font-semibold text-sm flex items-center gap-1.5 transition-all active:scale-95 
+                    ${isDarkMode ? 'bg-white/[0.06] border border-white/[0.1] text-slate-300 hover:bg-white/[0.1]' : 'bg-slate-100 border border-slate-300 text-slate-700 hover:bg-slate-200'}`}
+                >
+                  <span>↻</span> Tozalash
+                </button>
+              </div>
               <button
                 type="submit"
                 disabled={isTodayClosed}
@@ -1049,12 +1238,13 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                     { full: 'Ruxsat idx', short: 'Idx' },
                     { full: 'Vazn', short: 'Vazn' },
                     { full: 'Xodim', short: 'Xdm' },
+                    { full: 'B.macla', short: 'Msl' },
                     { full: 'Qoldiq', short: 'Qol' },
                     { full: "Yoqilg'i", short: "Yoq." },
                     { full: 'Hisob', short: 'His' },
                     { full: '', short: '' }
                   ].map((h, i) => (
-                    <th key={i} className={`px-2 sm:px-3 py-2 sm:py-3 text-[10px] sm:text-xs font-black drop-shadow-[0_1px_0_rgba(0,0,0,0.25)] whitespace-nowrap ${isDarkMode ? 'border-b border-amber-500/60' : 'border-b border-amber-400/70'} ${i === 0 ? 'text-center w-10' : ''} ${i >= 10 ? 'text-right' : ''} ${i === 13 ? 'w-20' : ''}`}>
+                    <th key={i} className={`px-2 sm:px-3 py-2 sm:py-3 text-[10px] sm:text-xs font-black drop-shadow-[0_1px_0_rgba(0,0,0,0.25)] whitespace-nowrap ${isDarkMode ? 'border-b border-amber-500/60' : 'border-b border-amber-400/70'} ${i === 0 ? 'text-center w-10' : ''} ${i >= 10 ? 'text-right' : ''} ${i === 14 ? 'w-20' : ''}`}>
                       <span className="sm:hidden">{h.short}</span>
                       <span className="hidden sm:inline">{h.full}</span>
                     </th>
@@ -1064,7 +1254,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
               <tbody>
                 {visibleRows.length === 0 && (
                   <tr>
-                    <td colSpan={14} className={`text-center py-12 text-sm ${isDarkMode ? 'text-slate-600' : 'text-slate-400'}`}>
+                    <td colSpan={15} className={`text-center py-12 text-sm ${isDarkMode ? 'text-slate-600' : 'text-slate-400'}`}>
                       Hozircha ma&apos;lumot yo&apos;q
                     </td>
                   </tr>
@@ -1081,6 +1271,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                     <td className={`px-3 py-2.5 text-sm ${t.tableCell}`}>{row.trainNumber}</td>
                     <td className={`px-3 py-2.5 text-sm ${t.tableCell}`}>{row.weight}</td>
                     <td className={`px-3 py-2.5 text-sm ${t.tableCell} max-w-[120px] truncate`}>{row.staffName}</td>
+                    <td className={`px-3 py-2.5 text-sm text-right font-mono font-semibold ${t.tableMono}`}>{row.maslaAmount ? formatAmount(row.maslaAmount) : ''}</td>
                     <td className={`px-3 py-2.5 text-sm text-right font-mono font-semibold ${t.tableMono}`}>{formatAmount(row.balanceBefore)}</td>
                     <td className={`px-3 py-2.5 text-sm text-right font-mono font-bold ${t.tableFuel}`}>{formatAmount(row.fuelAmount)}</td>
                     <td className={`px-3 py-2.5 text-sm text-right font-mono font-bold ${t.tableSum}`}>{formatAmount(roundAmount(parseAmount(row.balanceBefore) + parseAmount(row.fuelAmount)))}</td>
@@ -1164,28 +1355,30 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                 </div>
                 <button onClick={closeModal} className={`${t.closeBtn} p-2 rounded-full transition-all`}><span>✖</span></button>
               </div>
-              <div className="flex overflow-hidden flex-1 min-h-0">
+              <div className="flex flex-col sm:flex-row overflow-y-auto sm:overflow-hidden flex-1 min-h-0">
                 {/* ERJU list */}
-                <div className={`w-44 sm:w-52 shrink-0 overflow-y-auto p-3 space-y-1 ${t.panelBg}`}>
+                <div className={`w-full sm:w-52 shrink-0 overflow-x-auto sm:overflow-y-auto p-3 ${t.panelBg} border-b sm:border-b-0 ${isDarkMode ? 'border-white/[0.08]' : 'border-slate-200'}`}>
                   <p className={`text-[10px] font-bold uppercase tracking-widest px-2 pb-1 ${t.modalSub}`}>Mintaqalar</p>
-                  {ERJU_DATA.map(erju => {
-                    const cnt = staffList.filter(s => s.erju === erju.name).length;
-                    const active = selectedErju === erju.name;
-                    return (
-                      <button key={erju.name} onClick={() => handleErjuSelect(erju.name)}
-                        className={`w-full text-left px-3 py-2.5 rounded-xl transition-all flex items-center justify-between
-                          ${active ? t.sidebarActive : t.sidebarItem}`}>
-                        <div>
-                          <p className="font-semibold text-xs leading-tight">{erju.name}</p>
-                          <p className={`text-[10px] mt-0.5 ${active ? 'opacity-80' : (isDarkMode ? 'text-slate-500' : 'text-slate-400')}`}>{cnt} ta xodim</p>
-                        </div>
-                        <span className="text-xs opacity-60">›</span>
-                      </button>
-                    );
-                  })}
+                  <div className="grid grid-cols-1 sm:grid-cols-1 gap-1.5 min-w-[280px] sm:min-w-0">
+                    {ERJU_DATA.map(erju => {
+                      const cnt = staffList.filter(s => s.erju === erju.name).length;
+                      const active = selectedErju === erju.name;
+                      return (
+                        <button key={erju.name} onClick={() => handleErjuSelect(erju.name)}
+                          className={`w-full text-left px-3 py-2.5 rounded-xl transition-all flex items-center justify-between
+                            ${active ? t.sidebarActive : t.sidebarItem}`}>
+                          <div className="min-w-0">
+                            <p className="font-semibold text-xs leading-tight break-words">{erju.name}</p>
+                            <p className={`text-[10px] mt-0.5 ${active ? 'opacity-80' : (isDarkMode ? 'text-slate-500' : 'text-slate-400')}`}>{cnt} ta xodim</p>
+                          </div>
+                          <span className="text-xs opacity-60 shrink-0">›</span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
                 {/* Zapravka & Add form */}
-                <div className={`w-56 sm:w-64 shrink-0 overflow-y-auto p-4 space-y-4 ${t.panelBg}`}>
+                <div className={`w-full sm:w-64 shrink-0 overflow-y-auto p-4 space-y-4 ${t.panelBg} border-b sm:border-b-0 ${isDarkMode ? 'border-white/[0.08]' : 'border-slate-200'}`}>
                   {!selectedErju ? <p className={`text-sm text-center pt-10 ${t.modalSub}`}>ERJU tanlang</p> : (
                     <>
                       <div>
@@ -1221,7 +1414,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                   )}
                 </div>
                 {/* Staff list */}
-                <div className="flex-1 overflow-y-auto p-4">
+                <div className="flex-1 overflow-y-auto p-4 min-h-[32vh] sm:min-h-0">
                   {!selectedErju ? (
                     <div className="flex flex-col items-center justify-center h-full gap-2 opacity-40">
                       <span className="text-3xl">👥</span>
@@ -1244,30 +1437,30 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                                       className={`w-full ${t.panelInput} rounded-lg px-2 py-1.5 text-xs outline-none`}>
                                       {selectedErjuData?.zapravkalar.map(z => <option key={z} value={z}>{z}</option>)}
                                     </select>
-                                    <div className="flex gap-2">
+                                    <div className="flex flex-col sm:flex-row gap-2">
                                       <input value={editStaff.tabel} onChange={e => setEditStaff(p => ({ ...p, tabel: e.target.value }))}
-                                        className={`w-24 ${t.panelInput} rounded-lg px-2 py-1.5 text-xs outline-none`} placeholder="Tabel" />
+                                        className={`w-full sm:w-24 ${t.panelInput} rounded-lg px-2 py-1.5 text-xs outline-none`} placeholder="Tabel" />
                                       <input value={editStaff.name} onChange={e => setEditStaff(p => ({ ...p, name: e.target.value }))}
                                         className={`flex-1 ${t.panelInput} rounded-lg px-2 py-1.5 text-xs outline-none`} placeholder="F.I.SH" />
                                     </div>
-                                    <div className="flex gap-2">
+                                    <div className="flex flex-col sm:flex-row gap-2">
                                       <button onClick={saveStaffEdit} className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold">✓ Saqlash</button>
                                       <button onClick={() => setEditingStaffId(null)} className={`px-3 py-1.5 rounded-lg text-xs ${isDarkMode ? 'bg-white/10 text-slate-300' : 'bg-slate-200 text-slate-600'}`}>Bekor</button>
                                     </div>
                                   </div>
                                 ) : (
-                                  <div className="flex items-center justify-between">
-                                    <div className="flex items-center gap-3">
+                                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                                    <div className="flex items-start gap-3 min-w-0">
                                       <span className={`font-mono text-xs w-5 ${isDarkMode ? 'text-slate-600' : 'text-slate-400'}`}>{i + 1}</span>
-                                      <div>
+                                      <div className="min-w-0">
                                         <div className="flex items-center gap-2 flex-wrap">
-                                          <span className={`font-semibold text-sm ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>{staff.fullName}</span>
+                                          <span className={`font-semibold text-sm break-words ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>{staff.fullName}</span>
                                           <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono ${isDarkMode ? 'bg-blue-600/30 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>#{staff.tabelNumber}</span>
                                         </div>
                                         <p className={`text-[10px] mt-0.5 ${isDarkMode ? 'text-slate-500' : 'text-slate-400'}`}>{staff.zapravka}</p>
                                       </div>
                                     </div>
-                                    <div className="flex gap-1 transition-all">
+                                    <div className="flex gap-1 transition-all self-end sm:self-auto">
                                       <button onClick={() => { setEditingStaffId(staff.id); setEditStaff({ name: staff.fullName, tabel: staff.tabelNumber, zapravka: staff.zapravka }); }}
                                         className={`p-1.5 rounded-lg text-xs ${isDarkMode ? 'text-blue-400 hover:bg-blue-400/10' : 'text-blue-600 hover:bg-blue-100'}`}>✏️</button>
                                       <button onClick={async () => { await deleteDoc(doc(db, 'staff', staff.id)); }}
@@ -1327,7 +1520,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                 <div className="space-y-2">
                   {moveOptions.map(m => (
                     <div key={m.key} className={`${isDarkMode ? 'bg-white/[0.04] border border-white/[0.08]' : 'bg-slate-50 border border-slate-200'} rounded-2xl px-4 py-3`}>
-                      {editingMoveKey === m.key ? (
+                      {editingMoveKey === m.id ? (
                         <div className="grid grid-cols-2 gap-3">
                           <input value={editMoveKey} onChange={e => setEditMoveKey(e.target.value)} className={`${t.panelInput} rounded-xl px-3 py-2 text-sm outline-none`} />
                           <input value={editMoveValue} onChange={e => setEditMoveValue(e.target.value)} className={`${t.panelInput} rounded-xl px-3 py-2 text-sm outline-none`} />
@@ -1343,9 +1536,9 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                             <span className={`text-sm font-medium ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>{m.value}</span>
                           </div>
                           <div className="flex gap-1.5">
-                            <button onClick={() => { setEditingMoveKey(m.key); setEditMoveKey(m.key); setEditMoveValue(m.value); }}
+                            <button onClick={() => { setEditingMoveKey(m.id); setEditMoveKey(m.key); setEditMoveValue(m.value); }}
                               className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${isDarkMode ? 'bg-blue-600/20 text-blue-300 hover:bg-blue-500/30' : 'bg-blue-100 text-blue-700 hover:bg-blue-200'}`}>Edit</button>
-                            <button onClick={async () => { await deleteDoc(doc(db, 'moveOptions', m.key)); }}
+                            <button onClick={async () => { await deleteDoc(doc(db, 'moveOptions', m.id)); }}
                               className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${isDarkMode ? 'bg-rose-600/20 text-rose-300 hover:bg-rose-500/30' : 'bg-red-100 text-red-700 hover:bg-red-200'}`}>Del</button>
                           </div>
                         </div>
@@ -1398,7 +1591,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                 <div className="space-y-2">
                   {seriesOptionsState.map(m => (
                     <div key={m.key} className={`${isDarkMode ? 'bg-white/[0.04] border border-white/[0.08]' : 'bg-slate-50 border border-slate-200'} rounded-2xl px-4 py-3`}>
-                      {editingSeriesKey === m.key ? (
+                      {editingSeriesKey === m.id ? (
                         <div className="grid grid-cols-2 gap-3">
                           <input value={editSeriesKey} onChange={e => setEditSeriesKey(e.target.value)} className={`${t.panelInput} rounded-xl px-3 py-2 text-sm outline-none`} />
                           <input value={editSeriesValue} onChange={e => setEditSeriesValue(e.target.value)} className={`${t.panelInput} rounded-xl px-3 py-2 text-sm outline-none`} />
@@ -1414,9 +1607,9 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                             <span className={`text-sm font-medium ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>{m.value}</span>
                           </div>
                           <div className="flex gap-1.5">
-                            <button onClick={() => { setEditingSeriesKey(m.key); setEditSeriesKey(m.key); setEditSeriesValue(m.value); }}
+                            <button onClick={() => { setEditingSeriesKey(m.id); setEditSeriesKey(m.key); setEditSeriesValue(m.value); }}
                               className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${isDarkMode ? 'bg-blue-600/20 text-blue-300 hover:bg-blue-500/30' : 'bg-blue-100 text-blue-700 hover:bg-blue-200'}`}>Edit</button>
-                            <button onClick={async () => { await deleteDoc(doc(db, 'seriesOptions', m.key)); }}
+                            <button onClick={async () => { await deleteDoc(doc(db, 'seriesOptions', m.id)); }}
                               className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${isDarkMode ? 'bg-rose-600/20 text-rose-300 hover:bg-rose-500/30' : 'bg-red-100 text-red-700 hover:bg-red-200'}`}>Del</button>
                           </div>
                         </div>
@@ -1483,6 +1676,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                         <th className="border p-1">Vaqt</th>
                         <th className="border p-1">Zapravka</th>
                         <th className="border p-1">Harakat</th>
+                        <th className="border p-1">B.macla</th>
                         <th className="border p-1">Yoqilg&apos;i</th>
                         <th className="border p-1">Hisob</th>
                       </tr>
@@ -1494,6 +1688,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                           <td className="border p-1 text-center">{r.time}</td>
                           <td className="border p-1">{r.supplyPoint}</td>
                           <td className="border p-1">{r.moveType}</td>
+                          <td className="border p-1 text-right">{r.maslaAmount ? formatAmount(r.maslaAmount) : ''}</td>
                           <td className="border p-1 text-right">{formatAmount(r.fuelAmount)}</td>
                           <td className="border p-1 text-right">{formatAmount(roundAmount(parseAmount(r.balanceBefore) + parseAmount(r.fuelAmount)))}</td>
                         </tr>
@@ -1592,20 +1787,31 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
           </div>
         )}
 
+        {chatToast && (
+          <button
+            type="button"
+            onClick={() => { setIsChatOpen(true); setChatToast(''); }}
+            className={`fixed z-[10042] right-4 top-4 rounded-2xl px-4 py-3 text-sm font-semibold shadow-2xl transition-all ${
+              isDarkMode ? 'bg-amber-400 text-slate-950' : 'bg-slate-900 text-white'
+            }`}
+          >
+            Sizda yangi xabar bor
+          </button>
+        )}
         <button
           type="button"
           onPointerDown={onChatPointerDown}
           onPointerMove={onChatPointerMove}
           onPointerUp={onChatPointerUp}
-          className="fixed z-[10040] w-12 h-12 rounded-full bg-fuchsia-600 hover:bg-fuchsia-500 text-white shadow-xl text-lg touch-none"
+          className="fixed z-[10040] w-14 h-14 rounded-full bg-fuchsia-600 hover:bg-fuchsia-500 text-white shadow-xl text-xl touch-none"
           style={{ left: `${chatButtonPos.x}px`, top: `${chatButtonPos.y}px` }}
           title="Suhbat"
         >
           💬
         </button>
         {isChatOpen && (
-          <div className={`fixed z-[10041] w-[320px] max-w-[calc(100vw-1rem)] rounded-2xl overflow-hidden ${t.modalBg}`}
-            style={{ left: `${Math.max(8, Math.min(chatButtonPos.x - 264, window.innerWidth - 330))}px`, top: `${Math.max(8, chatButtonPos.y - 330)}px` }}>
+          <div className={`fixed z-[10041] w-[380px] max-w-[calc(100vw-1rem)] rounded-2xl overflow-hidden ${t.modalBg}`}
+            style={{ left: `${Math.max(8, Math.min(chatButtonPos.x - 320, window.innerWidth - 390))}px`, top: `${Math.max(8, chatButtonPos.y - 390)}px` }}>
             <div className={`px-3 py-2 flex items-center justify-between ${t.modalHeader}`}>
               <span className={`text-xs font-bold ${t.modalTitle}`}>User/Admin Chat</span>
               <div className="flex items-center gap-1">
@@ -1613,7 +1819,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
                 <button onClick={() => setIsChatOpen(false)} className="text-xs px-2">✖</button>
               </div>
             </div>
-            <div className="h-64 overflow-y-auto p-2 space-y-2">
+            <div className="h-80 overflow-y-auto p-3 space-y-2.5">
               {chatMessages.map((m) => (
                 <div key={m.id} className={`px-2 py-1.5 rounded-lg text-xs ${m.role === 'admin' ? 'bg-blue-600/20 text-blue-200' : 'bg-emerald-600/20 text-emerald-200'}`}>
                   <div className="font-semibold mb-0.5">{m.role === 'admin' ? 'Admin' : 'User'}</div>
@@ -1677,6 +1883,7 @@ const TrainFuelSystem = ({ isAdmin = false }: { isAdmin?: boolean }) => {
 interface FormInputProps {
   label: string;
   type?: string;
+  inputMode?: React.HTMLAttributes<HTMLInputElement>['inputMode'];
   value: string | undefined;
   onChange: (v: string) => void;
   theme: string;
@@ -1685,12 +1892,13 @@ interface FormInputProps {
   inputRef?: (node: HTMLInputElement | null) => void;
   onKeyDown?: React.KeyboardEventHandler<HTMLInputElement>;
 }
-const FormInput = ({ label, type = 'text', value, onChange, theme, labelClass, placeholder, inputRef, onKeyDown }: FormInputProps) => (
+const FormInput = ({ label, type = 'text', inputMode, value, onChange, theme, labelClass, placeholder, inputRef, onKeyDown }: FormInputProps) => (
   <div className="flex flex-col gap-1">
     <label className={`text-[10px] font-bold uppercase tracking-wider ${labelClass}`}>{label}</label>
     <input
       ref={inputRef}
       type={type}
+      inputMode={inputMode}
       value={value || ''}
       onChange={e => onChange(e.target.value)}
       onKeyDown={onKeyDown}
